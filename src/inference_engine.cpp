@@ -1,0 +1,913 @@
+#include "ryzenai/inference_engine.h"
+#include <ort_genai.h>
+#include <ort_genai_c.h>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <cstdlib>
+#include <thread>
+#include <chrono>
+
+namespace ryzenai {
+
+namespace fs = std::filesystem;
+
+InferenceEngine::InferenceEngine(const std::string& model_path, int ctx_size)
+    : ctx_size_(ctx_size) {
+
+    std::cout << "[InferenceEngine] Initializing with model: " << model_path << std::endl;
+
+    // Resolve model path (handles Hugging Face cache structure)
+    model_path_ = resolveModelPath(model_path);
+    if (model_path_ != model_path) {
+        std::cout << "[InferenceEngine] Resolved to: " << model_path_ << std::endl;
+    }
+    
+    // Validate model directory
+    if (!validateModelDirectory(model_path_)) {
+        throw std::runtime_error("Invalid model directory: " + model_path_);
+    }
+    
+    // Auto-detect execution mode from genai_config.json
+    execution_mode_ = detectExecutionMode();
+    std::cout << "[InferenceEngine] Detected execution mode: " << execution_mode_ << std::endl;
+    
+    // Detect Ryzen AI version and load config
+    loadRaiConfig();
+
+    // Establish the context window. Read the model's native context_length, then
+    // pick: explicit --ctx-size (clamped to native) > native context_length.
+    // This replaces the legacy 2048 default unless rai_config.json pinned a value.
+    try {
+        std::string cfg = model_path_ + "/genai_config.json";
+        if (fs::exists(cfg)) {
+            std::ifstream f(cfg);
+            json c = json::parse(f);
+            model_context_length_ = c["model"].value("context_length", 0);
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[WARNING] Could not read context_length: " << e.what() << std::endl;
+    }
+    if (!rai_max_prompt_set_) {
+        if (ctx_size_ > 0) {
+            max_prompt_length_ = (model_context_length_ > 0)
+                ? std::min(ctx_size_, model_context_length_) : ctx_size_;
+        } else if (model_context_length_ > 0) {
+            max_prompt_length_ = model_context_length_;
+        }
+    }
+    std::cout << "[InferenceEngine] Context window: model_context_length="
+              << model_context_length_ << ", requested ctx_size=" << ctx_size_
+              << ", effective max_prompt_length=" << max_prompt_length_ << std::endl;
+
+    // Setup execution provider
+    setupExecutionProvider();
+    
+    // Load the model
+    loadModel();
+    
+    // Extract model name from path
+    model_name_ = fs::path(model_path_).filename().string();
+    
+    // Load default generation params from genai_config.json
+    std::string config_path = model_path_ + "/genai_config.json";
+    if (fs::exists(config_path)) {
+        try {
+            std::ifstream file(config_path);
+            json config = json::parse(file);
+            
+            if (config.contains("search")) {
+                json search = config["search"];
+                has_search_config_ = true;
+                
+                // Load defaults from search config (matching Python implementation)
+                // NOTE: search.max_length from genai_config.json means TOTAL sequence length,
+                // but default_params_.max_length is used as "max NEW tokens" in our code.
+                // We intentionally DON'T load search.max_length here to avoid semantic confusion.
+                // The user's max_tokens parameter will be used directly as max new tokens.
+                
+                if (search.contains("temperature") && search["temperature"].is_number()) {
+                    default_params_.temperature = search["temperature"];
+                }
+                if (search.contains("top_p") && search["top_p"].is_number()) {
+                    default_params_.top_p = search["top_p"];
+                }
+                if (search.contains("top_k") && search["top_k"].is_number()) {
+                    default_params_.top_k = search["top_k"];
+                }
+                if (search.contains("repetition_penalty") && search["repetition_penalty"].is_number()) {
+                    default_params_.repetition_penalty = search["repetition_penalty"];
+                }
+                if (search.contains("do_sample") && search["do_sample"].is_boolean()) {
+                    default_params_.do_sample = search["do_sample"];
+                }
+                
+                std::cout << "[InferenceEngine] Loaded search config from genai_config.json" << std::endl;
+                std::cout << "  - temperature: " << default_params_.temperature << std::endl;
+                std::cout << "  - top_p: " << default_params_.top_p << std::endl;
+                std::cout << "  - top_k: " << default_params_.top_k << std::endl;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "[WARNING] Failed to load search config from genai_config.json: " << e.what() << std::endl;
+        }
+    }
+    
+    std::cout << "[InferenceEngine] Model loaded successfully: " << model_name_ << std::endl;
+    std::cout << "[InferenceEngine] Max prompt length: " << max_prompt_length_ << " tokens" << std::endl;
+}
+
+InferenceEngine::~InferenceEngine() {
+    std::cout << "[InferenceEngine] Shutting down" << std::endl;
+}
+
+GenerationParams InferenceEngine::getDefaultParams() const {
+    return default_params_;
+}
+
+std::string InferenceEngine::applyChatTemplate(const std::string& messages_json, const std::string& tools_json) {
+    // Parse messages
+    json messages = json::parse(messages_json);
+    std::ostringstream prompt;
+    
+    // Check if we have a Qwen-style chat template (contains <|im_start|>)
+    bool is_qwen_style = !chat_template_.empty() && 
+                         (chat_template_.find("<|im_start|>") != std::string::npos ||
+                          chat_template_.find("\\u003c|im_start|\\u003e") != std::string::npos);
+    
+    // If tools are provided, always use OGA's built-in template (it handles tools properly)
+    if (!tools_json.empty()) {
+        try {
+            const char* template_str = chat_template_.empty() ? nullptr : chat_template_.c_str();
+            const char* tools_str = tools_json.c_str();
+            
+            auto result = tokenizer_->ApplyChatTemplate(
+                template_str,
+                messages_json.c_str(),
+                tools_str,
+                true
+            );
+            
+            std::cout << "[InferenceEngine] Applied chat template with tools" << std::endl;
+            return std::string(result);
+            
+        } catch (const std::exception& e) {
+            std::cerr << "[ERROR] Failed to apply chat template with tools: " << e.what() << std::endl;
+            throw;
+        }
+    } else if (is_qwen_style) {
+        // Use Qwen/ChatML format: <|im_start|>role\ncontent<|im_end|>\n
+        for (const auto& msg : messages) {
+            std::string role = msg.value("role", "user");
+            std::string content = msg.value("content", "");
+            
+            prompt << "<|im_start|>" << role << "\n"
+                   << content << "<|im_end|>\n";
+        }
+        
+        // Add generation prompt for assistant
+        prompt << "<|im_start|>assistant\n";
+        
+        std::cout << "[InferenceEngine] Applied Qwen/ChatML template" << std::endl;
+    } else {
+        // Try using the OGA's built-in chat template
+        try {
+            const char* template_str = chat_template_.empty() ? nullptr : chat_template_.c_str();
+            
+            auto result = tokenizer_->ApplyChatTemplate(
+                template_str,
+                messages_json.c_str(),
+                nullptr,
+                true
+            );
+            
+            return std::string(result);
+            
+        } catch (const std::exception& e) {
+            std::cerr << "[WARNING] OGA chat template failed: " << e.what() << std::endl;
+            std::cerr << "[WARNING] Using simple fallback template" << std::endl;
+            
+            // Simple fallback template
+            prompt.str("");  // Clear
+            for (const auto& msg : messages) {
+                std::string role = msg.value("role", "user");
+                std::string content = msg.value("content", "");
+                
+                if (role == "system") {
+                    prompt << "System: " << content << "\n\n";
+                } else if (role == "user") {
+                    prompt << "User: " << content << "\n\n";
+                } else if (role == "assistant") {
+                    prompt << "Assistant: " << content << "\n\n";
+                }
+            }
+            
+            prompt << "Assistant: ";
+        }
+    }
+    
+    return prompt.str();
+}
+
+std::string InferenceEngine::resolveModelPath(const std::string& path) {
+    // If path has a "snapshots" subdirectory (Hugging Face cache structure),
+    // automatically find the latest snapshot
+    std::string snapshots_dir = path + "/snapshots";
+    if (fs::exists(snapshots_dir) && fs::is_directory(snapshots_dir)) {
+        std::cout << "[InferenceEngine] Detected Hugging Face cache structure, looking for snapshot..." << std::endl;
+        
+        // Find the first (and usually only) snapshot directory
+        for (const auto& entry : fs::directory_iterator(snapshots_dir)) {
+            if (entry.is_directory()) {
+                std::string snapshot_path = entry.path().string();
+                std::cout << "[InferenceEngine] Found snapshot: " << snapshot_path << std::endl;
+                return snapshot_path;
+            }
+        }
+        
+        std::cerr << "[ERROR] No snapshot found in: " << snapshots_dir << std::endl;
+        return path;
+    }
+    
+    // Otherwise, use the path as-is
+    return path;
+}
+
+bool InferenceEngine::validateModelDirectory(const std::string& path) {
+    if (!fs::exists(path) || !fs::is_directory(path)) {
+        std::cerr << "[ERROR] Model path does not exist or is not a directory: " << path << std::endl;
+        return false;
+    }
+    
+    // Check for required files (at minimum genai_config.json)
+    std::string config_path = path + "/genai_config.json";
+    if (!fs::exists(config_path)) {
+        std::cerr << "[ERROR] Required file not found: " << config_path << std::endl;
+        return false;
+    }
+    
+    return true;
+}
+
+std::string InferenceEngine::detectRyzenAIVersion() {
+    // Priority 1: Check RYZENAI_VERSION environment variable directly
+    const char* version_env = std::getenv("RYZENAI_VERSION");
+    if (version_env) {
+        return std::string(version_env);
+    }
+
+    // Priority 2: Check RYZENAI_INSTALL_PATH environment variable and extract version
+    const char* install_path_env = std::getenv("RYZENAI_INSTALL_PATH");
+    if (install_path_env) {
+        std::string path_str(install_path_env);
+        // Remove trailing slashes
+        while (!path_str.empty() && (path_str.back() == '/' || path_str.back() == '\\')) {
+            path_str.pop_back();
+        }
+        // Extract version from path (e.g., "/opt/ryzenai/1.7.0" -> "1.7.0")
+        size_t last_slash = path_str.find_last_of("/\\");
+        if (last_slash != std::string::npos) {
+            std::string version = path_str.substr(last_slash + 1);
+            // Validate it looks like a version number: starts with digit and contains a dot
+            if (!version.empty() && std::isdigit(version[0]) && version.find('.') != std::string::npos) {
+                return version;
+            }
+        }
+    }
+
+    // Priority 3: Check platform-specific default paths
+#ifdef _WIN32
+    std::string ryzenai_path_17 = "C:/Program Files/RyzenAI/1.7.0";
+#else
+    std::string ryzenai_path_17 = "/opt/ryzenai/1.7.0";
+#endif
+
+    if (fs::exists(ryzenai_path_17)) {
+        return "1.7.0";
+    }
+
+    // Default fallback
+    return "1.7.0";
+}
+
+std::string InferenceEngine::detectExecutionMode() {
+    // Auto-detect execution mode from genai_config.json by inspecting
+    // session_options in model.decoder. The key indicators are:
+    //
+    // NPU:    "hybrid_opt_token_backend": "npu" in either config_entries
+    //         or provider_options[].RyzenAI
+    // Hybrid: provider_options[].RyzenAI exists (without token_backend=npu)
+    // CPU:    empty provider_options, no config_entries
+    
+    std::string config_path = model_path_ + "/genai_config.json";
+    if (!fs::exists(config_path)) {
+        std::cout << "[InferenceEngine] No genai_config.json found, defaulting to cpu mode" << std::endl;
+        return "cpu";
+    }
+    
+    try {
+        std::ifstream file(config_path);
+        json config = json::parse(file);
+        
+        auto& session_opts = config["model"]["decoder"]["session_options"];
+
+        // Check provider_options for the AMDGPU provider (hipep EP, gfx GPU).
+        // genai_config.json selects this EP via provider_options:[{"AMDGPU":{...}}].
+        if (session_opts.contains("provider_options") &&
+            session_opts["provider_options"].is_array()) {
+            for (const auto& provider : session_opts["provider_options"]) {
+                if (provider.contains("AMDGPU")) {
+                    return "gpu";
+                }
+            }
+        }
+
+        // Check config_entries for hybrid_opt_token_backend == "npu"
+        if (session_opts.contains("config_entries")) {
+            auto& entries = session_opts["config_entries"];
+            if (entries.contains("hybrid_opt_token_backend") &&
+                entries["hybrid_opt_token_backend"] == "npu") {
+                return "npu";
+            }
+        }
+        
+        // Check provider_options for RyzenAI configuration
+        if (session_opts.contains("provider_options") && 
+            session_opts["provider_options"].is_array()) {
+            for (const auto& provider : session_opts["provider_options"]) {
+                if (provider.contains("RyzenAI")) {
+                    auto& ryzenai = provider["RyzenAI"];
+                    // If RyzenAI has hybrid_opt_token_backend == "npu", it's NPU
+                    if (ryzenai.contains("hybrid_opt_token_backend") &&
+                        ryzenai["hybrid_opt_token_backend"] == "npu") {
+                        return "npu";
+                    }
+                    // Otherwise RyzenAI provider present means hybrid
+                    return "hybrid";
+                }
+            }
+        }
+        
+        // No RyzenAI provider, no NPU config_entries → CPU
+        return "cpu";
+        
+    } catch (const std::exception& e) {
+        std::cerr << "[WARNING] Failed to detect execution mode from genai_config.json: " 
+                  << e.what() << std::endl;
+        std::cerr << "[WARNING] Defaulting to cpu mode" << std::endl;
+        return "cpu";
+    }
+}
+
+void InferenceEngine::loadRaiConfig() {
+    // Detect Ryzen AI version
+    ryzenai_version_ = detectRyzenAIVersion();
+    std::cout << "[InferenceEngine] Ryzen AI version: " << ryzenai_version_ << std::endl;
+    
+    // Load rai_config.json if it exists
+    std::string rai_config_path = model_path_ + "/rai_config.json";
+    if (fs::exists(rai_config_path)) {
+        try {
+            std::ifstream file(rai_config_path);
+            json config = json::parse(file);
+            
+            if (config.contains("max_prompt_length") && 
+                config["max_prompt_length"].contains(ryzenai_version_)) {
+                max_prompt_length_ = config["max_prompt_length"][ryzenai_version_];
+                rai_max_prompt_set_ = true;
+                std::cout << "[InferenceEngine] Loaded max_prompt_length from rai_config.json: "
+                         << max_prompt_length_ << std::endl;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "[WARNING] Failed to parse rai_config.json: " << e.what() << std::endl;
+        }
+    }
+}
+
+void InferenceEngine::setupExecutionProvider() {
+    std::cout << "[InferenceEngine] Setting up execution provider for mode: " << execution_mode_ << std::endl;
+    
+    // Note: Actual execution provider configuration happens in ONNX Runtime GenAI
+    // based on the genai_config.json file. This method is mainly for validation.
+    
+    if (execution_mode_ == "npu") {
+        std::cout << "[InferenceEngine] Using NPU (VitisAI) execution provider" << std::endl;
+    } else if (execution_mode_ == "hybrid") {
+        std::cout << "[InferenceEngine] Using Hybrid (NPU + iGPU) execution provider" << std::endl;
+    } else if (execution_mode_ == "cpu") {
+        std::cout << "[InferenceEngine] Using CPU execution provider" << std::endl;
+    }
+}
+
+void InferenceEngine::loadModel() {
+    try {
+        std::cout << "[InferenceEngine] Loading ONNX model from: " << model_path_ << std::endl;
+        
+        // Create model using factory method
+        model_ = OgaModel::Create(model_path_.c_str());
+        
+        // Create tokenizer using factory method
+        tokenizer_ = OgaTokenizer::Create(*model_);
+        
+        // Load chat template from tokenizer_config.json
+        std::string tokenizer_config_path = model_path_ + "/tokenizer_config.json";
+        if (fs::exists(tokenizer_config_path)) {
+            try {
+                std::ifstream file(tokenizer_config_path);
+                json config = json::parse(file);
+                if (config.contains("chat_template") && config["chat_template"].is_string()) {
+                    chat_template_ = config["chat_template"];
+                    std::cout << "[InferenceEngine] Loaded chat template from tokenizer_config.json" << std::endl;
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "[WARNING] Failed to load chat template: " << e.what() << std::endl;
+            }
+        }
+
+        // Many exported VLMs (e.g. Qwen-VL) ship the template as a standalone
+        // chat_template.jinja rather than inline in tokenizer_config.json.
+        if (chat_template_.empty()) {
+            std::string jinja_path = model_path_ + "/chat_template.jinja";
+            if (fs::exists(jinja_path)) {
+                std::ifstream jf(jinja_path);
+                std::stringstream ss;
+                ss << jf.rdbuf();
+                chat_template_ = ss.str();
+                std::cout << "[InferenceEngine] Loaded chat template from chat_template.jinja" << std::endl;
+            }
+        }
+
+        // Detect and initialize multimodal (vision) pipeline if present.
+        detectMultimodal();
+
+        std::cout << "[InferenceEngine] Model and tokenizer loaded successfully" << std::endl;
+        
+    } catch (const std::exception& e) {
+        throw std::runtime_error("Failed to load model: " + std::string(e.what()));
+    }
+}
+
+std::vector<int32_t> InferenceEngine::truncatePrompt(const std::vector<int32_t>& input_ids) {
+    if (input_ids.size() <= static_cast<size_t>(max_prompt_length_)) {
+        return input_ids;
+    }
+    
+    // Truncate from the beginning to keep the most recent context
+    size_t truncate_amount = input_ids.size() - max_prompt_length_;
+    std::cout << "[WARNING] Prompt exceeds maximum length (" 
+              << input_ids.size() << " > " << max_prompt_length_ 
+              << "). Truncating " << truncate_amount << " tokens from the beginning."
+              << std::endl;
+    
+    return std::vector<int32_t>(
+        input_ids.begin() + truncate_amount, 
+        input_ids.end()
+    );
+}
+
+std::string InferenceEngine::complete(const std::string& prompt, const GenerationParams& params, CompletionTimingData* out_timing) {
+    std::lock_guard<std::mutex> lock(inference_mutex_);
+    
+    try {
+        // Start timing
+        auto start_time = std::chrono::high_resolution_clock::now();
+        auto first_token_time = start_time;
+        bool first_token_received = false;
+        
+        // Tokenize input
+        auto sequences = OgaSequences::Create();
+        tokenizer_->Encode(prompt.c_str(), *sequences);
+        
+        // Get token IDs and apply truncation
+        const int32_t* input_ids_ptr = sequences->SequenceData(0);
+        size_t input_ids_count = sequences->SequenceCount(0);
+        std::vector<int32_t> input_ids(input_ids_ptr, input_ids_ptr + input_ids_count);
+        input_ids = truncatePrompt(input_ids);
+        
+        // Create generator params
+        auto gen_params = OgaGeneratorParams::Create(*model_);
+        // max_length should be prompt_length + max_new_tokens
+        // params.max_length is max_new_tokens from the caller
+        int total_max_length = static_cast<int>(input_ids.size()) + params.max_length;
+        if (model_context_length_ > 0 && total_max_length > model_context_length_) {
+            total_max_length = model_context_length_;
+        }
+        gen_params->SetSearchOption("max_length", total_max_length);
+        gen_params->SetSearchOption("temperature", params.temperature);
+        gen_params->SetSearchOption("top_p", params.top_p);
+        gen_params->SetSearchOption("top_k", static_cast<double>(params.top_k));
+        gen_params->SetSearchOption("repetition_penalty", params.repetition_penalty);
+        gen_params->SetSearchOptionBool("do_sample", params.do_sample);
+        // Lock random_seed to 1 for deterministic behavior (matching Python reference)
+        gen_params->SetSearchOption("random_seed", 1.0);
+        
+        // Generate
+        auto generator = OgaGenerator::Create(*model_, *gen_params);
+        
+        // Set input tokens
+        generator->AppendTokens(input_ids.data(), input_ids.size());
+        
+        std::cout << "[InferenceEngine] Generating tokens..." << std::endl;
+        
+        while (!generator->IsDone()) {
+            generator->GenerateNextToken();
+            
+            // Track time to first token
+            if (!first_token_received) {
+                first_token_time = std::chrono::high_resolution_clock::now();
+                first_token_received = true;
+            }
+        }
+        
+        // End timing
+        auto end_time = std::chrono::high_resolution_clock::now();
+        
+        // Get the output
+        const int32_t* output_ptr = generator->GetSequenceData(0);
+        size_t output_count = generator->GetSequenceCount(0);
+        
+        // Calculate actual generated token count
+        int generated_token_count = (output_count > input_ids.size()) 
+            ? static_cast<int>(output_count - input_ids.size()) 
+            : 0;
+        
+        // Calculate timing metrics
+        auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+        auto ttft_duration = std::chrono::duration_cast<std::chrono::milliseconds>(first_token_time - start_time);
+        double ttft_seconds = ttft_duration.count() / 1000.0;
+        double total_time_ms = static_cast<double>(total_duration.count());
+        
+        // Calculate TPS: tokens generated after the first token, divided by time after first token
+        double decode_time_seconds = (total_duration.count() - ttft_duration.count()) / 1000.0;
+        double tps = 0.0;
+        if (generated_token_count > 1 && decode_time_seconds > 0) {
+            // TPS = (tokens - 1) / decode_time (exclude first token from TPS calculation)
+            tps = (generated_token_count - 1) / decode_time_seconds;
+        } else if (generated_token_count == 1 && total_time_ms > 0) {
+            // Only one token generated - use total time
+            tps = 1.0 / (total_time_ms / 1000.0);
+        }
+        
+        // Return timing data if requested
+        if (out_timing != nullptr) {
+            out_timing->token_count = generated_token_count;
+            out_timing->ttft_seconds = ttft_seconds;
+            out_timing->tps = tps;
+            out_timing->total_time_ms = total_time_ms;
+        }
+        
+        // Decode only the newly generated tokens (skip the input prompt)
+        std::string result;
+        if (output_count > input_ids.size()) {
+            auto decoded = tokenizer_->Decode(output_ptr + input_ids.size(), output_count - input_ids.size());
+            result = std::string(decoded);
+        } else {
+            // No new tokens generated
+            result = "";
+        }
+        
+        // Apply stop sequences - remove stop sequence and everything after it
+        for (const auto& stop_seq : params.stop_sequences) {
+            size_t pos = result.find(stop_seq);
+            if (pos != std::string::npos) {
+                result = result.substr(0, pos);
+                break;  // Stop at first match
+            }
+        }
+        
+        std::cout << "[InferenceEngine] Generated " << generated_token_count << " tokens in " 
+                  << total_time_ms << "ms (TTFT: " << (ttft_seconds * 1000) << "ms, TPS: " << tps << ")" << std::endl;
+        
+        return result;
+        
+    } catch (const std::exception& e) {
+        throw std::runtime_error("Inference failed: " + std::string(e.what()));
+    }
+}
+
+void InferenceEngine::streamComplete(const std::string& prompt, 
+                                     const GenerationParams& params,
+                                     StreamCallback callback) {
+    std::lock_guard<std::mutex> lock(inference_mutex_);
+    
+    try {
+        // Tokenize input
+        auto sequences = OgaSequences::Create();
+        tokenizer_->Encode(prompt.c_str(), *sequences);
+        
+        // Get token IDs and apply truncation
+        const int32_t* input_ids_ptr = sequences->SequenceData(0);
+        size_t input_ids_count = sequences->SequenceCount(0);
+        std::vector<int32_t> input_ids(input_ids_ptr, input_ids_ptr + input_ids_count);
+        input_ids = truncatePrompt(input_ids);
+        
+        // Create generator params
+        auto gen_params = OgaGeneratorParams::Create(*model_);
+        // max_length should be prompt_length + max_new_tokens
+        // params.max_length is max_new_tokens from the caller
+        int total_max_length = static_cast<int>(input_ids.size()) + params.max_length;
+        if (model_context_length_ > 0 && total_max_length > model_context_length_) {
+            total_max_length = model_context_length_;
+        }
+        std::cout << "[InferenceEngine::streamComplete] prompt_length=" << input_ids.size()
+                  << ", max_new_tokens=" << params.max_length
+                  << ", total_max_length=" << total_max_length << std::endl;
+        gen_params->SetSearchOption("max_length", total_max_length);
+        gen_params->SetSearchOption("temperature", params.temperature);
+        gen_params->SetSearchOption("top_p", params.top_p);
+        gen_params->SetSearchOption("top_k", static_cast<double>(params.top_k));
+        gen_params->SetSearchOption("repetition_penalty", params.repetition_penalty);
+        gen_params->SetSearchOptionBool("do_sample", params.do_sample);
+        // Lock random_seed to 1 for deterministic behavior (matching Python reference)
+        gen_params->SetSearchOption("random_seed", 1.0);
+        
+        // Generate
+        auto generator = OgaGenerator::Create(*model_, *gen_params);
+        
+        // Set input tokens
+        generator->AppendTokens(input_ids.data(), input_ids.size());
+        
+        std::cout << "[InferenceEngine] Generating tokens (streaming)..." << std::endl;
+        
+        // Use OgaTokenizerStream for efficient incremental token decoding
+        auto tokenizer_stream = OgaTokenizerStream::Create(*tokenizer_);
+        
+        size_t token_count = 0;
+        std::string accumulated_output;  // Track full output for stop sequence detection
+        bool client_disconnected = false;  // Track if client disconnected
+        
+        while (!generator->IsDone() && !client_disconnected) {
+            generator->GenerateNextToken();
+            
+            // Get just the new token
+            const int32_t* all_tokens = generator->GetSequenceData(0);
+            size_t num_tokens = generator->GetSequenceCount(0);
+            int32_t new_token = all_tokens[num_tokens - 1];
+            
+            // Decode incrementally using tokenizer stream (this works!)
+            const char* decoded = tokenizer_stream->Decode(new_token);
+            if (decoded && decoded[0] != '\0') {
+                std::string token_str(decoded);
+                
+                // Check for stop sequences before accumulating
+                bool should_stop = false;
+                for (const auto& stop_seq : params.stop_sequences) {
+                    // Check if adding this token would complete a stop sequence
+                    std::string temp_output = accumulated_output + token_str;
+                    if (temp_output.find(stop_seq) != std::string::npos) {
+                        should_stop = true;
+                        break;
+                    }
+                }
+                
+                if (should_stop) {
+                    // Stop generation - don't send this token
+                    break;
+                }
+                
+                accumulated_output += token_str;
+                bool is_final = generator->IsDone();
+                
+                // Call callback and check if client is still connected
+                if (!callback(token_str, is_final)) {
+                    client_disconnected = true;
+                    std::cout << "[InferenceEngine] Client disconnected, stopping generation" << std::endl;
+                    break;
+                }
+            }
+            
+            token_count++;
+        }
+        
+        if (client_disconnected) {
+            std::cout << "[InferenceEngine] Generation stopped early due to client disconnect (generated " 
+                      << token_count << " tokens)" << std::endl;
+        }
+        
+        std::cout << "[InferenceEngine] Generated " << token_count << " tokens (streaming)" << std::endl;
+        
+    } catch (const std::exception& e) {
+        throw std::runtime_error("Streaming inference failed: " + std::string(e.what()));
+    }
+}
+
+int InferenceEngine::countTokens(const std::string& text) {
+    try {
+        auto sequences = OgaSequences::Create();
+        tokenizer_->Encode(text.c_str(), *sequences);
+        return static_cast<int>(sequences->SequenceCount(0));
+    } catch (const std::exception& e) {
+        std::cerr << "[WARNING] Failed to count tokens: " << e.what() << std::endl;
+        return 0;
+    }
+}
+
+void InferenceEngine::detectMultimodal() {
+    // A model is multimodal if genai_config.json declares a vision (or speech)
+    // pipeline, or a processor_config.json is present alongside the model.
+    bool looks_multimodal = false;
+    try {
+        std::string config_path = model_path_ + "/genai_config.json";
+        if (fs::exists(config_path)) {
+            std::ifstream file(config_path);
+            json config = json::parse(file);
+            const auto& model = config["model"];
+            if (model.contains("vision") || model.contains("speech") ||
+                model.contains("image_token_id")) {
+                looks_multimodal = true;
+            }
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[WARNING] multimodal detection failed: " << e.what() << std::endl;
+    }
+    if (!looks_multimodal && fs::exists(model_path_ + "/processor_config.json")) {
+        looks_multimodal = true;
+    }
+
+    if (!looks_multimodal) {
+        return;
+    }
+
+    try {
+        processor_ = OgaMultiModalProcessor::Create(*model_);
+        is_multimodal_ = true;
+        std::cout << "[InferenceEngine] Multimodal (vision) pipeline initialized" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "[WARNING] Failed to create multimodal processor: " << e.what()
+                  << " (continuing as text-only)" << std::endl;
+        is_multimodal_ = false;
+    }
+}
+
+std::string InferenceEngine::applyChatTemplateRaw(const std::string& messages_json,
+                                                  const std::string& tools_json) {
+    const char* template_str = chat_template_.empty() ? nullptr : chat_template_.c_str();
+    const char* tools_str = tools_json.empty() ? nullptr : tools_json.c_str();
+    auto result = tokenizer_->ApplyChatTemplate(template_str, messages_json.c_str(), tools_str, true);
+    return std::string(result);
+}
+
+namespace {
+// Configure search options on generator params, shared by the multimodal paths.
+void apply_search_options(OgaGeneratorParams& gen_params, const GenerationParams& params,
+                          int total_max_length) {
+    gen_params.SetSearchOption("max_length", total_max_length);
+    gen_params.SetSearchOption("temperature", params.temperature);
+    gen_params.SetSearchOption("top_p", params.top_p);
+    gen_params.SetSearchOption("top_k", static_cast<double>(params.top_k));
+    gen_params.SetSearchOption("repetition_penalty", params.repetition_penalty);
+    gen_params.SetSearchOptionBool("do_sample", params.do_sample);
+    gen_params.SetSearchOption("random_seed", 1.0);
+}
+}  // namespace
+
+std::string InferenceEngine::completeMultimodal(const std::string& prompt,
+                                                const std::vector<std::string>& images,
+                                                const GenerationParams& params,
+                                                CompletionTimingData* out_timing) {
+    std::lock_guard<std::mutex> lock(inference_mutex_);
+    if (!processor_) {
+        throw std::runtime_error("Multimodal completion requested but model is not multimodal");
+    }
+
+    auto start_time = std::chrono::high_resolution_clock::now();
+    auto first_token_time = start_time;
+    bool first_token_received = false;
+
+    // Load images from in-memory buffers.
+    std::vector<const void*> data_ptrs;
+    std::vector<size_t> data_sizes;
+    for (const auto& img : images) {
+        data_ptrs.push_back(img.data());
+        data_sizes.push_back(img.size());
+    }
+    std::unique_ptr<OgaImages> oga_images;
+    if (!images.empty()) {
+        oga_images = OgaImages::Load(data_ptrs.data(), data_sizes.data(), data_ptrs.size());
+    }
+
+    auto inputs = processor_->ProcessImages(prompt.c_str(), oga_images.get());
+
+    int input_len = 0;
+    try {
+        auto ids = inputs->Get("input_ids");
+        auto shape = ids->Shape();
+        if (!shape.empty()) input_len = static_cast<int>(shape.back());
+    } catch (...) {}
+
+    int total_max_length = input_len + params.max_length;
+    if (model_context_length_ > 0 && total_max_length > model_context_length_) {
+        total_max_length = model_context_length_;
+    }
+    auto gen_params = OgaGeneratorParams::Create(*model_);
+    apply_search_options(*gen_params, params, total_max_length);
+
+    auto generator = OgaGenerator::Create(*model_, *gen_params);
+    generator->SetInputs(*inputs);
+
+    auto stream = OgaTokenizerStream::Create(*processor_);
+    std::string result;
+    int generated = 0;
+    while (!generator->IsDone() && generated < params.max_length) {
+        generator->GenerateNextToken();
+        if (!first_token_received) {
+            first_token_time = std::chrono::high_resolution_clock::now();
+            first_token_received = true;
+        }
+        const int32_t* toks = generator->GetSequenceData(0);
+        size_t n = generator->GetSequenceCount(0);
+        const char* decoded = stream->Decode(toks[n - 1]);
+        if (decoded && decoded[0] != '\0') result += decoded;
+        generated++;
+
+        bool stop_hit = false;
+        for (const auto& stop_seq : params.stop_sequences) {
+            size_t pos = result.find(stop_seq);
+            if (pos != std::string::npos) { result = result.substr(0, pos); stop_hit = true; break; }
+        }
+        if (stop_hit) break;
+    }
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    if (out_timing) {
+        auto total = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+        auto ttft = std::chrono::duration_cast<std::chrono::milliseconds>(first_token_time - start_time);
+        double decode_s = (total.count() - ttft.count()) / 1000.0;
+        out_timing->token_count = generated;
+        out_timing->ttft_seconds = ttft.count() / 1000.0;
+        out_timing->tps = (generated > 1 && decode_s > 0) ? (generated - 1) / decode_s : 0.0;
+        out_timing->total_time_ms = static_cast<double>(total.count());
+    }
+    std::cout << "[InferenceEngine] Generated " << generated << " tokens (multimodal)" << std::endl;
+    return result;
+}
+
+void InferenceEngine::streamCompleteMultimodal(const std::string& prompt,
+                                               const std::vector<std::string>& images,
+                                               const GenerationParams& params,
+                                               StreamCallback callback) {
+    std::lock_guard<std::mutex> lock(inference_mutex_);
+    if (!processor_) {
+        throw std::runtime_error("Multimodal completion requested but model is not multimodal");
+    }
+
+    std::vector<const void*> data_ptrs;
+    std::vector<size_t> data_sizes;
+    for (const auto& img : images) {
+        data_ptrs.push_back(img.data());
+        data_sizes.push_back(img.size());
+    }
+    std::unique_ptr<OgaImages> oga_images;
+    if (!images.empty()) {
+        oga_images = OgaImages::Load(data_ptrs.data(), data_sizes.data(), data_ptrs.size());
+    }
+
+    auto inputs = processor_->ProcessImages(prompt.c_str(), oga_images.get());
+
+    int input_len = 0;
+    try {
+        auto ids = inputs->Get("input_ids");
+        auto shape = ids->Shape();
+        if (!shape.empty()) input_len = static_cast<int>(shape.back());
+    } catch (...) {}
+
+    int total_max_length = input_len + params.max_length;
+    if (model_context_length_ > 0 && total_max_length > model_context_length_) {
+        total_max_length = model_context_length_;
+    }
+    auto gen_params = OgaGeneratorParams::Create(*model_);
+    apply_search_options(*gen_params, params, total_max_length);
+
+    auto generator = OgaGenerator::Create(*model_, *gen_params);
+    generator->SetInputs(*inputs);
+
+    auto stream = OgaTokenizerStream::Create(*processor_);
+    std::string accumulated;
+    int generated = 0;
+    bool client_disconnected = false;
+    while (!generator->IsDone() && generated < params.max_length && !client_disconnected) {
+        generator->GenerateNextToken();
+        const int32_t* toks = generator->GetSequenceData(0);
+        size_t n = generator->GetSequenceCount(0);
+        const char* decoded = stream->Decode(toks[n - 1]);
+        generated++;
+        if (decoded && decoded[0] != '\0') {
+            std::string token_str(decoded);
+            bool should_stop = false;
+            for (const auto& stop_seq : params.stop_sequences) {
+                if ((accumulated + token_str).find(stop_seq) != std::string::npos) { should_stop = true; break; }
+            }
+            if (should_stop) break;
+            accumulated += token_str;
+            bool is_final = generator->IsDone() || generated >= params.max_length;
+            if (!callback(token_str, is_final)) {
+                client_disconnected = true;
+                break;
+            }
+        }
+    }
+    std::cout << "[InferenceEngine] Generated " << generated << " tokens (multimodal stream)" << std::endl;
+}
+
+} // namespace ryzenai
+
