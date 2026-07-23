@@ -1,456 +1,138 @@
-# Ryzen AI LLM Server
+# AMD GPU LLM Server (AMDGPU EP)
 
-A lightweight, OpenAI API-compatible server for running LLMs on AMD Ryzen AI NPUs using ONNX Runtime GenAI.
+A lightweight, OpenAI API-compatible server for running LLMs and vision-language
+models (VLMs) on **AMD GPUs** using ONNX Runtime GenAI (OGA) with the **hipep /
+AMDGPU execution provider**. Validated on **gfx1151 (Strix Halo)**.
 
-## Overview
+It is the GPU counterpart to [ryzenai-server](https://github.com/lemonade-sdk/ryzenai-server)
+(NPU) and is consumed by [Lemonade](https://github.com/lemonade-sdk/lemonade) as
+the **`amdgpu-llm`** wrapped-server backend. A companion Python
+[whisper transcription server](#whisper-transcription-server) provides the
+**`amdgpu-whisper`** speech-to-text backend.
 
-This server enables running Large Language Models on AMD Ryzen AI 300-series processors with NPU acceleration. It implements the OpenAI API specification, making it compatible with existing LLM applications and tools.
+## Features
 
-**Key Features:**
-- **OpenAI API Compatible:** `/v1/chat/completions`, `/v1/completions`, `/v1/responses`
-- **Tool/Function Calling:** OpenAI-compatible function calling support
-- **Multiple Execution Modes:** NPU, Hybrid (NPU+iGPU), CPU
-- **Streaming Support:** Real-time Server-Sent Events for all endpoints
-- **Echo Parameter:** Option to include prompt in completion output
-- **Stop Sequences:** Custom stop sequences for generation control
-- **Minimal Dependencies:** Single executable + DLLs
-- **Simple Architecture:** One-model-per-process design
+- **OpenAI API compatible:** `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/health`
+- **Vision (VLM):** OpenAI `image_url` content (base64 data URLs) → OGA multimodal processor
+- **Streaming** (SSE) and non-streaming
+- **Tool/function calling**
+- **GPU execution** via the AMDGPU EP, selected by the model's `genai_config.json`
+- **Context window** driven by `--ctx-size` and the model's native `context_length`
 
-## Building from Source
+## How it works
 
-### Prerequisites
+The AMDGPU EP is selected entirely by the model. A model runs on the GPU when its
+`genai_config.json` sets:
 
-**Windows Requirements:**
-- Windows 11 (64-bit)
-- Visual Studio 2022
-- CMake 3.20 or higher
-- **Ryzen AI Software 1.7.0**
-  - Default installation path: `C:\Program Files\RyzenAI\1.7.0`
-  - Download from: https://ryzenai.docs.amd.com
-
-**Hardware Requirements:**
-- AMD Ryzen AI 300- or 400-series processor (for NPU execution)
-- Minimum 16GB RAM (32GB recommended for larger models)
-
-### Build Steps (Windows)
-
-```cmd
-# Clone the repository
-git clone https://github.com/lemonade-sdk/ryzenai-server.git
-cd ryzenai-server
-
-# Create and enter build directory
-mkdir build
-cd build
-
-# Configure with CMake
-cmake .. -G "Visual Studio 17 2022" -A x64
-
-# Build
-cmake --build . --config Release
+```json
+"provider_options": [ { "AMDGPU": { "profile": "llm" } } ]
 ```
 
-### Build Steps (Linux)
+The server is a thin OGA wrapper: it loads the model with `OgaModel::Create`,
+applies the chat template, and generates. For VLMs it uses `OgaMultiModalProcessor`
+to fold decoded images into the prompt.
 
-**Linux Requirements:**
-- Ubuntu 22.04+ or equivalent Linux distribution
-- GCC 9+ or Clang 10+
-- CMake 3.20 or higher
-- **Ryzen AI Software 1.7.0 for Linux**
-  - Default installation path: `/opt/ryzenai/1.7.0`
-  - Download from: https://ryzenai.docs.amd.com
+## Prerequisites
 
-```bash
-# Clone the repository
-git clone https://github.com/lemonade-sdk/ryzenai-server.git
-cd ryzenai-server
+- **Windows 11 (x64)**
+- **AMD GPU, gfx1151 (Strix Halo)**, with the AMD graphics driver installed
+  (provides `amdhip64_7.dll`)
+- **Visual Studio 2022 or 2026**, **CMake 3.20+**
+- The **AMD GPU package** ("gpu-test-package") — ships `onnxruntime-genai.dll`,
+  the AMDGPU/hipep EP, and the ROCm runtime DLLs. Point `AMDGPU_PKG_ROOT` at the
+  extracted directory (it must contain `bin/onnxruntime-genai.dll`).
 
-# Create and enter build directory
-mkdir build
-cd build
+> The package ships the OGA DLL but **no import library and no OGA headers**, so
+> the build (a) synthesizes `onnxruntime-genai.lib` from the DLL's exports via
+> `tools/gen_oga_import_lib.ps1` (dumpbin → .def → lib.exe) and (b) vendors the
+> matching upstream OGA C/C++ headers (v0.14.0) into `external/oga`.
 
-# Configure with CMake
-cmake .. -DCMAKE_BUILD_TYPE=Release
+## Building
 
-# Build
-cmake --build .
+```powershell
+# Point at the extracted AMD GPU package (contains bin\onnxruntime-genai.dll)
+$env:AMDGPU_PKG_ROOT = "C:\path\to\gpu-test-package"
+#   ... or pass -DAMDGPU_PKG_ROOT=C:\path\to\gpu-test-package to cmake
+
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64      # or "Visual Studio 18 2026"
+cmake --build build --config Release
 ```
 
-### Build Output
+Output: `build\bin\Release\amdgpu-server.exe`, with the package's EP/ROCm/OGA DLLs
+copied next to it (so the loader resolves everything from the exe's own directory).
 
-**Windows:** The executable and required DLLs will be created at:
-```
-build\bin\Release\ryzenai-server.exe
-```
+Header-only deps (cpp-httplib, nlohmann/json) and the OGA headers are downloaded
+into `external/` at configure time.
 
-**Linux:** The executable and required shared libraries will be created at:
-```
-build/bin/ryzenai-server
-```
+## Running
 
-All necessary Ryzen AI libraries (DLLs on Windows, .so files on Linux) are automatically copied to the output directory during build.
-
-**Note:** The Ryzen AI libraries included in the release are licensed under the AMD Software End User License Agreement. See `AMD_LICENSE` in the release package for full terms.
-
-### Custom Ryzen AI Installation Path
-
-If Ryzen AI is installed in a custom location, you can specify it using either an environment variable (recommended) or a CMake option.
-
-**Option 1: Environment Variable (works for both build and runtime)**
-
-```bash
-# Linux/macOS
-export RYZENAI_INSTALL_PATH=/custom/path/ryzenai/1.7.0
-cmake .. -DCMAKE_BUILD_TYPE=Release
-cmake --build .
-
-# Windows (PowerShell)
-$env:RYZENAI_INSTALL_PATH="C:\custom\path\RyzenAI\1.7.0"
-cmake .. -G "Visual Studio 17 2022" -A x64
-cmake --build . --config Release
+```powershell
+build\bin\Release\amdgpu-server.exe -m C:\path\to\onnx-model --port 8080 --verbose
 ```
 
-**Option 2: CMake Option (build-time only)**
+| Flag | Meaning |
+|------|---------|
+| `-m, --model PATH` | ONNX model directory (with `genai_config.json`) |
+| `-p, --port PORT` | Port (default 8080) |
+| `--host HOST` | Bind address (default 127.0.0.1) |
+| `-c, --ctx-size N` | Context window; `<=0` uses the model's native `context_length` |
+| `-v, --verbose` | Verbose logging |
 
-```bash
-# Linux
-cmake .. -DCMAKE_BUILD_TYPE=Release -DOGA_ROOT=/custom/path/ryzenai/1.7.0
+The model's `genai_config.json` must select the AMDGPU provider (see above);
+models exported for DirectML ship `"provider_options": [{"dml": {}}]` — replace
+that block.
 
-# Windows
-cmake .. -G "Visual Studio 17 2022" -A x64 -DOGA_ROOT="C:\custom\path\RyzenAI\1.7.0"
-```
+### Vision (VLM) requests
 
-**Priority Order:**
-1. `RYZENAI_INSTALL_PATH` environment variable (highest priority)
-2. `-DOGA_ROOT` CMake cache variable
-3. Platform-specific defaults (`C:/Program Files/RyzenAI/1.7.0` on Windows, `/opt/ryzenai/1.7.0` on Linux)
+Send OpenAI-style content arrays; base64 `image_url` data URLs are decoded and fed
+through the multimodal processor:
 
-## Code Structure
-
-```
-ryzenai-server/
-├── CMakeLists.txt              # Build configuration
-│
-├── src/                        # Source files
-│   ├── main.cpp                # Entry point
-│   ├── server.cpp              # HTTP server (cpp-httplib)
-│   ├── inference_engine.cpp    # ONNX Runtime GenAI wrapper
-│   ├── command_line.cpp        # CLI argument parsing
-│   ├── types.cpp               # Data structures
-│   ├── tool_calls.cpp          # OpenAI tool/function calling
-│   └── reasoning.cpp           # Reasoning content handling
-│
-├── include/ryzenai/            # Headers
-│   ├── server.h
-│   ├── inference_engine.h
-│   ├── command_line.h
-│   ├── types.h
-│   ├── tool_calls.h
-│   └── reasoning.h
-│
-└── external/                   # Header-only dependencies
-    ├── cpp-httplib/            # HTTP server (auto-downloaded)
-    └── json/                   # JSON library (auto-downloaded)
-```
-
-## Architecture Overview
-
-### Design Principles
-
-1. **Simplicity**: One process serves one model - no dynamic loading/unloading
-2. **RAII**: Resource management follows C++ best practices with smart pointers
-3. **Thread Safety**: Shared resources protected with proper synchronization
-4. **Single Binary**: Minimal dependencies for easy deployment
-
-### Component Layers
-
-```
-┌─────────────────────────────────────────────────┐
-│         HTTP Server (cpp-httplib)               │
-│         OpenAI API Endpoints                    │
-├─────────────────────────────────────────────────┤
-│         Request Handlers                        │
-│         (chat, completions, streaming)          │
-├─────────────────────────────────────────────────┤
-│         Inference Engine                        │
-│         ONNX Runtime GenAI                      │
-├─────────────────────────────────────────────────┤
-│         Execution Providers                     │
-│         NPU / Hybrid / CPU                      │
-└─────────────────────────────────────────────────┘
-```
-
-**Server:** HTTP server using cpp-httplib with OpenAI-compatible endpoints. Features:
-- 8-thread pool for concurrent request handling
-- Built-in CORS support (Access-Control-Allow-Origin: *)
-- Request routing and response formatting
-- Chunked transfer encoding for streaming
-
-**Inference Engine:** Wraps ONNX Runtime GenAI API, managing model loading, generation parameters, and streaming callbacks. Applies chat templates and handles tool call extraction.
-
-**Execution Providers:** Supports three modes (auto-detected from model config):
-- **Hybrid**: NPU + iGPU
-- **NPU**: Pure NPU execution
-- **CPU**: CPU-only fallback
-
-### Dependencies
-
-These dependencies are automatically downloaded during build:
-
-- **cpp-httplib** (v0.26.0) - HTTP server [MIT License]
-- **nlohmann/json** (v3.11.3) - JSON parsing [MIT License]
-
-These dependencies must be manually installed by the developer:
-- **ONNX Runtime GenAI** - Inference engine
-
-## Usage
-
-### Starting the Server
-
-**Windows:**
-```cmd
-# Start the server (execution mode is auto-detected from the model)
-ryzenai-server.exe -m C:\path\to\onnx\model
-
-# Custom port
-ryzenai-server.exe -m C:\path\to\onnx\model --port 8081
-
-# Verbose logging
-ryzenai-server.exe -m C:\path\to\onnx\model --verbose
-```
-
-**Linux:**
-```bash
-# Start the server (execution mode is auto-detected from the model)
-./ryzenai-server -m /opt/models/phi-3-mini-4k-instruct-onnx
-
-# With custom Ryzen AI installation path
-export RYZENAI_INSTALL_PATH=/custom/ryzenai/1.7.0
-./ryzenai-server -m /opt/models/phi-3-mini-4k-instruct-onnx
-
-# Custom port
-./ryzenai-server -m /opt/models/phi-3-mini-4k-instruct-onnx --port 8081
-
-# Verbose logging
-./ryzenai-server -m /opt/models/phi-3-mini-4k-instruct-onnx --verbose
-```
-
-### Command-Line Arguments
-
-- `-m, --model PATH` - Path to ONNX model directory (required)
-- `--host ADDRESS` - Server host address (default: 127.0.0.1)
-- `-p, --port PORT` - Server port (default: 8080)
-- `-c, --ctx-size SIZE` - Context size in tokens (default: 2048)
-- `-t, --threads NUM` - Number of CPU threads (default: 4)
-- `-v, --verbose` - Enable verbose logging
-- `-h, --help` - Show help message
-
-The execution mode (NPU, Hybrid, or CPU) is automatically detected from the model's `genai_config.json` configuration.
-
-### Model Requirements
-
-Models must be in ONNX format compatible with Ryzen AI. Required files:
-- `model.onnx` or `model.onnx.data`
-- `genai_config.json`
-- Tokenizer files (`tokenizer.json`, `tokenizer_config.json`, etc.)
-
-Models are typically cached in:
-
-**Windows:**
-```
-C:\Users\<Username>\.cache\huggingface\hub\
-```
-
-**Linux:**
-```
-~/.cache/huggingface/hub/
-```
-
-## API Endpoints
-
-The server implements OpenAI-compatible API endpoints.
-
-### Health Check
-
-```bash
-GET /health
-```
-
-Returns server status and Ryzen AI-specific information:
 ```json
 {
-  "status": "ok",
-  "model": "phi-3-mini-4k-instruct",
-  "execution_mode": "hybrid",
-  "max_prompt_length": 4096,
-  "ryzenai_version": "1.7.0"
+  "model": "ignored",
+  "messages": [{"role": "user", "content": [
+    {"type": "text", "text": "What is in this image?"},
+    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}
+  ]}]
 }
 ```
 
-### Other Endpoints
+## Whisper transcription server
 
-- `GET /` - Server information and available endpoints
-- `POST /v1/chat/completions` - Chat completions with tool/function calling support
-- `POST /v1/completions` - Text completions with echo parameter
-- `POST /v1/responses` - OpenAI Responses API format
+`whisper/whisper_server.py` is a small HTTP wrapper that runs the AMD GPU Whisper
+ONNX pipeline (encoder + decoder-with-KV-cache) on the AMDGPU EP and exposes it to
+Lemonade as the **`amdgpu-whisper`** backend.
 
-All endpoints support both streaming and non-streaming modes. The server applies chat templates automatically and extracts tool calls from model output.
+- `GET /health` → `{"status": "ok", ...}`
+- `POST /inference` → raw audio bytes in the body → `{"text": "..."}`
 
-## Testing
+Unlike the C++ LLM server, Whisper stays in Python because it relies on Hugging
+Face `transformers` (feature extractor + tokenizer) and a hand-rolled ORT
+encode/prefill/decode loop. It runs inside a Python environment built from the AMD
+package wheels (custom `onnxruntime` + the AMDGPU/hipep EP + `transformers` +
+`soundfile`), and it **imports `whisper_demo.py`**, which is shipped by AMD's
+gpu-test-package whisper demo and must be placed next to `whisper_server.py`
+(not included here).
 
-### Quick Test
-
-**Windows:**
-```cmd
-# Start the server
-cd build\bin\Release
-ryzenai-server.exe -m C:\path\to\model --verbose
-
-# Test health endpoint (in another terminal)
-curl http://localhost:8080/health
-
-# Test chat completion
-curl http://localhost:8080/v1/chat/completions ^
-  -H "Content-Type: application/json" ^
-  -d "{\"messages\": [{\"role\": \"user\", \"content\": \"Hello!\"}], \"max_tokens\": 50}"
+```powershell
+# in a Python 3.14 env with the AMD wheels installed, and whisper_demo.py alongside:
+python whisper/whisper_server.py -m C:\path\to\whisper-onnx-model --port 8081
 ```
 
-**Linux:**
-```bash
-# Start the server
-cd build/bin
-./ryzenai-server -m /path/to/model --verbose
+## Integration with Lemonade
 
-# Test health endpoint (in another terminal)
-curl http://localhost:8080/health
+When run under [Lemonade](https://github.com/lemonade-sdk/lemonade), these servers
+are managed as wrapped-server subprocesses:
 
-# Test chat completion
-curl http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"messages": [{"role": "user", "content": "Hello!"}], "max_tokens": 50}'
-```
+- **`amdgpu-llm`** → `amdgpu-server.exe` (this repo, C++)
+- **`amdgpu-whisper`** → `whisper/whisper_server.py` (Python)
 
-## Integration with Lemonade Server
-
-This server is designed to be used as a backend for [Lemonade Server](https://github.com/lemonade-sdk/lemonade). When running Lemonade Server, the `ryzenai-server` executable is automatically downloaded from GitHub releases and managed by the Lemonade Router.
-
-## Integration Examples
-
-### Python with OpenAI SDK
-
-```python
-from openai import OpenAI
-
-client = OpenAI(
-    base_url="http://localhost:8080/v1",
-    api_key="not-needed"
-)
-
-response = client.chat.completions.create(
-    model="ignored",  # Model is already loaded
-    messages=[
-        {"role": "user", "content": "What is 2+2?"}
-    ]
-)
-
-print(response.choices[0].message.content)
-```
-
-## Troubleshooting
-
-### "Model not found" or "Failed to load model"
-
-**Check:**
-1. Model path is correct and contains required ONNX files
-2. Ryzen AI 1.7.0 is installed at the correct path
-3. NPU drivers are up to date (Windows Update)
-4. Model is compatible with your Ryzen AI version
-
-### Missing DLLs
-
-All required DLLs should be automatically copied during build. If you get DLL errors:
-1. Verify Ryzen AI is installed correctly
-2. Rebuild with `cmake --build . --config Release`
-3. Manually copy DLLs from `C:\Program Files\RyzenAI\1.7.0\deployment\` to the executable directory
-
-### Port Already in Use
-
-If port 8080 is occupied:
-
-**Windows:**
-```cmd
-ryzenai-server.exe -m C:\path\to\model --port 8081
-```
-
-**Linux:**
-```bash
-./ryzenai-server -m /path/to/model --port 8081
-```
-
-### Linux-Specific Notes
-
-**Driver Detection:**
-On Linux, NPU driver detection is informational only. If the driver cannot be detected, the server will print a warning but continue startup. This is expected behavior as Linux driver interfaces may vary.
-
-**Library Loading:**
-The build system automatically copies required Ryzen AI libraries next to the executable and configures RPATH to search the executable's directory (`$ORIGIN`). This means:
-- No `LD_LIBRARY_PATH` setup required
-- The binary is relocatable - works from any directory
-- To use a different Ryzen AI version, rebuild with the appropriate `RYZENAI_INSTALL_PATH` or `OGA_ROOT`
-
-**Running from Different Directories:**
-Because RPATH is configured, you can run the server from any directory:
-```bash
-# These all work
-./build/bin/ryzenai-server -m /path/to/model
-cd build/bin && ./ryzenai-server -m /path/to/model
-/full/path/to/ryzenai-server -m /path/to/model
-```
-
-## Development
-
-### Code Style
-
-- C++17 standard
-- RAII for resource management
-- Smart pointers (no raw pointers)
-- Const correctness
-- Snake_case for functions
-- PascalCase for types
-
-### Building for Development
-
-**Windows:**
-```cmd
-cmake --build . --config Debug
-```
-
-Debug executable location: `build\bin\Debug\ryzenai-server.exe`
-
-**Linux:**
-```bash
-cmake .. -DCMAKE_BUILD_TYPE=Debug
-cmake --build .
-```
-
-Debug executable location: `build/bin/ryzenai-server`
-
-### Known Issues
-
-**Streaming with JSON Library:** Creating `nlohmann::json` objects directly in ONNX Runtime streaming callbacks can cause crashes. The workaround is to manually construct JSON strings in callbacks. This is stable and performs well.
-
-## Related Projects
-
-- **Ryzen AI Documentation:** https://ryzenai.docs.amd.com
-- **ONNX Runtime GenAI:** https://github.com/microsoft/onnxruntime-genai
-- **Lemonade Server:** https://github.com/lemonade-sdk/lemonade - Parent project providing model orchestration
+Lemonade forwards OpenAI-compatible requests to the subprocess and routes by model
+recipe. Both are `DEVICE_GPU` and can be loaded concurrently.
 
 ## License
 
-This project's **source code** is licensed under the **MIT License** - see [LICENSE](LICENSE) for details.
-
-**Release Artifacts (ryzenai-server.zip):**
-- The `ryzenai-server.exe` binary and the header-only dependencies (**cpp-httplib**, **nlohmann/json**) are MIT licensed
-- The **Ryzen AI DLLs** included in binary releases are licensed under the AMD Software End User License Agreement - see `AMD_LICENSE` file in the release package for full terms
-
-**Note:** When you download a release, the `AMD_LICENSE` file is included alongside the DLLs. The source code in this repository does not include the DLLs - they are copied from your local Ryzen AI installation during the build process.
+Source code is **MIT** (see `LICENSE`). The AMD GPU runtime DLLs copied next to the
+binary at build time are licensed under the **AMD Software End User License
+Agreement** (see `AMD_LICENSE`); they are not part of this repository and are not
+redistributed here.
