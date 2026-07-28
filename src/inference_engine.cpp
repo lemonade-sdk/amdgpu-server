@@ -55,6 +55,89 @@ void writeAppendDebugFile(const std::string& label,
     }
 }
 
+size_t countSubstring(const std::string& haystack, const std::string& needle) {
+    size_t count = 0;
+    size_t pos = 0;
+    while ((pos = haystack.find(needle, pos)) != std::string::npos) {
+        ++count;
+        pos += needle.size();
+    }
+    return count;
+}
+
+void logMultiTurnAppendPlan(const char* path_label,
+                            const std::string& conversation_id,
+                            size_t turn_number,
+                            bool is_first_turn,
+                            const std::string& full_prompt,
+                            const std::string& text_to_append,
+                            int full_tokens,
+                            int append_tokens,
+                            const char* input_mode) {
+    static constexpr const char* kUserTurnMarker = "<|im_start|>user";
+    const size_t user_markers = countSubstring(full_prompt, kUserTurnMarker);
+    const size_t full_chars = full_prompt.size();
+    const size_t append_chars = text_to_append.size();
+    const int saved_tokens = full_tokens - append_tokens;
+    const int saved_pct = (full_tokens > 0) ? static_cast<int>((saved_tokens * 100LL) / full_tokens) : 0;
+
+    std::cout << "[InferenceEngine][MultiTurnDebug] path=" << path_label
+              << " session=" << conversation_id
+              << " turn=" << turn_number
+              << " mode=" << (is_first_turn ? "APPEND_FULL" : "APPEND_DELTA")
+              << " input=" << input_mode
+              << " user_markers=" << user_markers
+              << " full_chars=" << full_chars
+              << " full_tokens=" << full_tokens
+              << " append_chars=" << append_chars
+              << " append_tokens=" << append_tokens;
+    if (!is_first_turn) {
+        std::cout << " saved_tokens=" << saved_tokens << " saved_pct=" << saved_pct << "%";
+    }
+    std::cout << std::endl;
+
+    if (!is_first_turn) {
+        std::cout << "[InferenceEngine][MultiTurnDebug] delta_head: "
+                  << text_to_append.substr(0, std::min(size_t(240), append_chars)) << std::endl;
+    }
+}
+
+void logMultiTurnAfterAppend(const char* path_label,
+                             size_t seq_before,
+                             size_t seq_after,
+                             bool is_done) {
+    std::cout << "[InferenceEngine][MultiTurnDebug] path=" << path_label
+              << " seq_before=" << seq_before
+              << " seq_after=" << seq_after
+              << " seq_delta=" << (seq_after > seq_before ? seq_after - seq_before : 0)
+              << " is_done=" << (is_done ? "true" : "false") << std::endl;
+    if (is_done && seq_after <= seq_before) {
+        std::cerr << "[InferenceEngine][MultiTurnDebug] WARNING: generator IsDone after append "
+                  << "with no new sequence tokens — generation loop will produce 0 output"
+                  << std::endl;
+    }
+}
+
+void logMultiTurnCompleted(const char* path_label,
+                           size_t turn_number,
+                           size_t seq_before,
+                           size_t seq_after,
+                           int generated_tokens,
+                           int streamed_tokens) {
+    std::cout << "[InferenceEngine][MultiTurnDebug] path=" << path_label
+              << " turn=" << turn_number
+              << " completed generated_tokens=" << generated_tokens
+              << " seq_before=" << seq_before
+              << " seq_after=" << seq_after;
+    if (streamed_tokens >= 0) {
+        std::cout << " streamed_tokens=" << streamed_tokens;
+    }
+    if (generated_tokens == 0) {
+        std::cout << " WARNING=zero_output";
+    }
+    std::cout << std::endl;
+}
+
 }  // namespace
 
 InferenceEngine::InferenceEngine(const std::string& model_path, int ctx_size)
@@ -869,18 +952,11 @@ std::string InferenceEngine::completeMultiTurn(const std::string& conversation_i
         }
 
         const int append_token_count = countTokens(text_to_append);
+        const int full_token_count = countTokens(full_prompt);
 
-        std::cout << "[InferenceEngine] Multi-turn turn=" << (session.turn_count + 1)
-                  << " session=" << conversation_id
-                  << " mode=" << (is_first_turn ? "APPEND_FULL" : "APPEND_DELTA")
-                  << " append_chars=" << text_to_append.length()
-                  << " append_tokens=" << append_token_count
-                  << " full_tokens=" << countTokens(full_prompt) << std::endl;
-        if (!is_first_turn) {
-            std::cout << "[InferenceEngine] Multi-turn delta (first 200): "
-                      << text_to_append.substr(0, std::min(size_t(200), text_to_append.length()))
-                      << std::endl;
-        }
+        logMultiTurnAppendPlan("text", conversation_id, session.turn_count + 1, is_first_turn,
+                               full_prompt, text_to_append, full_token_count, append_token_count,
+                               "AppendTokens");
 
         writeAppendDebugFile(is_first_turn ? "APPEND_FULL" : "APPEND_DELTA",
                              conversation_id,
@@ -889,6 +965,8 @@ std::string InferenceEngine::completeMultiTurn(const std::string& conversation_i
 
         const size_t seq_before = session.generator->GetSequenceCount(0);
         appendPromptText(*session.generator, text_to_append);
+        const size_t seq_after_append = session.generator->GetSequenceCount(0);
+        logMultiTurnAfterAppend("text", seq_before, seq_after_append, session.generator->IsDone());
 
         int total_max_length = static_cast<int>(session.generator->GetSequenceCount(0)) + params.max_length;
         if (model_context_length_ > 0 && total_max_length > model_context_length_) {
@@ -922,6 +1000,9 @@ std::string InferenceEngine::completeMultiTurn(const std::string& conversation_i
         }
 
         session.turn_count++;
+
+        logMultiTurnCompleted("text", session.turn_count, seq_before, output_count,
+                              generated_token_count, -1);
 
         if (out_timing != nullptr) {
             auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
@@ -970,17 +1051,22 @@ void InferenceEngine::streamMultiTurn(const std::string& conversation_id,
             throw std::runtime_error("Multi-turn request produced an empty delta prompt");
         }
 
-        std::cout << "[InferenceEngine] Multi-turn stream turn=" << (session.turn_count + 1)
-                  << " session=" << conversation_id
-                  << " mode=" << (is_first_turn ? "APPEND_FULL" : "APPEND_DELTA")
-                  << " append_tokens=" << countTokens(text_to_append) << std::endl;
+        const int append_token_count = countTokens(text_to_append);
+        const int full_token_count = countTokens(full_prompt);
+
+        logMultiTurnAppendPlan("text-stream", conversation_id, session.turn_count + 1, is_first_turn,
+                               full_prompt, text_to_append, full_token_count, append_token_count,
+                               "AppendTokens");
 
         writeAppendDebugFile(is_first_turn ? "APPEND_FULL" : "APPEND_DELTA",
                              conversation_id,
                              session.turn_count + 1,
                              text_to_append);
 
+        const size_t seq_before = session.generator->GetSequenceCount(0);
         appendPromptText(*session.generator, text_to_append);
+        const size_t seq_after_append = session.generator->GetSequenceCount(0);
+        logMultiTurnAfterAppend("text-stream", seq_before, seq_after_append, session.generator->IsDone());
 
         int total_max_length = static_cast<int>(session.generator->GetSequenceCount(0)) + params.max_length;
         if (model_context_length_ > 0 && total_max_length > model_context_length_) {
@@ -1026,6 +1112,13 @@ void InferenceEngine::streamMultiTurn(const std::string& conversation_id,
 
         accumulated_output = applyStopSequences(accumulated_output, params);
         session.turn_count++;
+
+        const size_t seq_after = session.generator->GetSequenceCount(0);
+        const int generated_token_count = (seq_after > seq_before)
+            ? static_cast<int>(seq_after - seq_before)
+            : 0;
+        logMultiTurnCompleted("text-stream", session.turn_count, seq_before, seq_after,
+                              generated_token_count, -1);
 
         std::cout << "[InferenceEngine] Multi-turn stream completed turn=" << session.turn_count
                   << " token_count=" << session.generator->TokenCount() << std::endl;
@@ -1150,14 +1243,14 @@ std::string InferenceEngine::completeMultiTurnMultimodal(const std::string& conv
         const std::vector<std::string>& images_for_process =
             is_first_turn ? all_images : new_turn_images;
 
-        std::cout << "[InferenceEngine] Multimodal multi-turn turn=" << (active_session.turn_count + 1)
-                  << " session=" << conversation_id
-                  << " mode=" << (is_first_turn ? "APPEND_FULL" : "APPEND_DELTA")
-                  << " append_chars=" << text_to_append.length()
-                  << " append_tokens=" << countTokens(text_to_append)
-                  << " new_turn_images=" << new_turn_images.size()
-                  << " process_images=" << images_for_process.size()
-                  << " full_tokens=" << countTokens(full_prompt) << std::endl;
+        const int append_token_count = countTokens(text_to_append);
+        const int full_token_count = countTokens(full_prompt);
+        const char* input_mode =
+            (is_first_turn && !images_for_process.empty()) ? "SetInputs" : "AppendTokens";
+
+        logMultiTurnAppendPlan("vlm", conversation_id, active_session.turn_count + 1, is_first_turn,
+                               full_prompt, text_to_append, full_token_count, append_token_count,
+                               input_mode);
 
         writeAppendDebugFile(is_first_turn ? "APPEND_FULL" : "APPEND_DELTA",
                              conversation_id,
@@ -1173,6 +1266,9 @@ std::string InferenceEngine::completeMultiTurnMultimodal(const std::string& conv
         } else {
             appendPromptText(*active_session.generator, text_to_append);
         }
+
+        const size_t seq_after_append = active_session.generator->GetSequenceCount(0);
+        logMultiTurnAfterAppend("vlm", seq_before, seq_after_append, active_session.generator->IsDone());
 
         int total_max_length = static_cast<int>(active_session.generator->GetSequenceCount(0)) + params.max_length;
         if (model_context_length_ > 0 && total_max_length > model_context_length_) {
@@ -1206,6 +1302,9 @@ std::string InferenceEngine::completeMultiTurnMultimodal(const std::string& conv
         }
 
         active_session.turn_count++;
+
+        logMultiTurnCompleted("vlm", active_session.turn_count, seq_before, output_count,
+                              generated_token_count, -1);
 
         if (out_timing != nullptr) {
             auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
@@ -1273,17 +1372,24 @@ void InferenceEngine::streamMultiTurnMultimodal(const std::string& conversation_
         const std::vector<std::string>& images_for_process =
             is_first_turn ? all_images : new_turn_images;
 
-        std::cout << "[InferenceEngine] Multimodal multi-turn stream turn=" << (session.turn_count + 1)
-                  << " session=" << conversation_id
-                  << " mode=" << (is_first_turn ? "APPEND_FULL" : "APPEND_DELTA")
-                  << " append_tokens=" << countTokens(text_to_append)
-                  << " new_turn_images=" << new_turn_images.size()
-                  << " process_images=" << images_for_process.size() << std::endl;
+        const int append_token_count = countTokens(text_to_append);
+        const int full_token_count = countTokens(full_prompt);
+        const char* input_mode =
+            (is_first_turn && !images_for_process.empty()) ? "SetInputs" : "AppendTokens";
+
+        logMultiTurnAppendPlan("vlm-stream", conversation_id, session.turn_count + 1, is_first_turn,
+                               full_prompt, text_to_append, full_token_count, append_token_count,
+                               input_mode);
+        std::cout << "[InferenceEngine][MultiTurnDebug] vlm-stream new_turn_images="
+                  << new_turn_images.size() << " process_images=" << images_for_process.size()
+                  << std::endl;
 
         writeAppendDebugFile(is_first_turn ? "APPEND_FULL" : "APPEND_DELTA",
                              conversation_id,
                              session.turn_count + 1,
                              text_to_append);
+
+        const size_t seq_before = session.generator->GetSequenceCount(0);
 
         if (is_first_turn && !images_for_process.empty()) {
             auto oga_images = loadOgaImages(images_for_process);
@@ -1292,6 +1398,9 @@ void InferenceEngine::streamMultiTurnMultimodal(const std::string& conversation_
         } else {
             appendPromptText(*session.generator, text_to_append);
         }
+
+        const size_t seq_after_append = session.generator->GetSequenceCount(0);
+        logMultiTurnAfterAppend("vlm-stream", seq_before, seq_after_append, session.generator->IsDone());
 
         int total_max_length = static_cast<int>(session.generator->GetSequenceCount(0)) + params.max_length;
         if (model_context_length_ > 0 && total_max_length > model_context_length_) {
@@ -1337,6 +1446,13 @@ void InferenceEngine::streamMultiTurnMultimodal(const std::string& conversation_
 
         accumulated_output = applyStopSequences(accumulated_output, params);
         session.turn_count++;
+
+        const size_t seq_after = session.generator->GetSequenceCount(0);
+        const int generated_token_count = (seq_after > seq_before)
+            ? static_cast<int>(seq_after - seq_before)
+            : 0;
+        logMultiTurnCompleted("vlm-stream", session.turn_count, seq_before, seq_after,
+                              generated_token_count, -1);
 
         std::cout << "[InferenceEngine] Multimodal multi-turn stream completed turn="
                   << session.turn_count << std::endl;

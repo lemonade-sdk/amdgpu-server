@@ -134,6 +134,27 @@ std::vector<std::string> extract_images_from_last_user_message(const json& reque
     return images;
 }
 
+void logOpenAIChatRequestSummary(const ChatCompletionRequest& chat_req, bool multimodal) {
+    std::ostringstream role_seq;
+    for (size_t i = 0; i < chat_req.messages.size(); ++i) {
+        if (i > 0) {
+            role_seq << " -> ";
+        }
+        role_seq << chat_req.messages[i].role;
+        if (chat_req.messages[i].content.find("<tool_response>") != std::string::npos) {
+            role_seq << "(tool_response)";
+        }
+    }
+
+    const size_t tool_count = chat_req.tools.is_array() ? chat_req.tools.size() : 0;
+    std::cout << "[Server][ChatDebug] client=openai-compat multimodal=" << (multimodal ? 1 : 0)
+              << " messages=" << chat_req.messages.size()
+              << " tools=" << tool_count
+              << " stream=" << chat_req.stream
+              << " session=" << kDefaultConversationId
+              << " roles=" << role_seq.str() << std::endl;
+}
+
 }  // namespace
 
 RyzenAIServer::RyzenAIServer(const CommandLineArgs& args) 
@@ -688,6 +709,8 @@ void RyzenAIServer::handleChatCompletions(const httplib::Request& req, httplib::
             return;
         }
 
+        logOpenAIChatRequestSummary(chat_req, inference_engine_->isMultimodal());
+
         // VLM models always use the multimodal multi-turn path (KV cache reuse on
         // text-only follow-ups). Only images in the latest user turn are processed.
         if (inference_engine_->isMultimodal()) {
@@ -719,7 +742,6 @@ void RyzenAIServer::handleChatCompletions(const httplib::Request& req, httplib::
         std::cout << "[Server DEBUG] Prompt (first 500 chars): " << prompt.substr(0, std::min(size_t(500), prompt.length())) << std::endl;
 
         // Text chat always uses the single default multi-turn AppendTokens session.
-        // (Tool definitions in the request do not disable this; only post-hoc tool parsing.)
         const bool use_multi_turn = true;
         const std::string session_id = kDefaultConversationId;
         
