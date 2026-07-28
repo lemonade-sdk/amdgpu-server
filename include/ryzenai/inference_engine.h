@@ -5,6 +5,7 @@
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 
 // Forward declarations for ONNX Runtime GenAI
 struct OgaModel;
@@ -15,6 +16,9 @@ struct OgaSequences;
 struct OgaMultiModalProcessor;
 
 namespace ryzenai {
+
+// Single global multi-turn session until clients opt in via conversation_id.
+inline constexpr const char* kDefaultConversationId = "default";
 
 // Timing data returned from completion
 struct CompletionTimingData {
@@ -41,7 +45,23 @@ public:
                        StreamCallback callback);
     
     // Apply chat template to messages
-    std::string applyChatTemplate(const std::string& messages_json, const std::string& tools_json = "");
+    std::string applyChatTemplate(const std::string& messages_json,
+                                    const std::string& tools_json = "",
+                                    bool add_generation_prompt = true);
+
+    // Multi-turn chat (non-tool): reuse one OgaGenerator per conversation_id and
+    // AppendTokens only the delta prompt on subsequent turns.
+    std::string completeMultiTurn(const std::string& conversation_id,
+                                  const std::string& messages_json,
+                                  const GenerationParams& params,
+                                  CompletionTimingData* out_timing = nullptr);
+
+    void streamMultiTurn(const std::string& conversation_id,
+                         const std::string& messages_json,
+                         const GenerationParams& params,
+                         StreamCallback callback);
+
+    void resetMultiTurnSession(const std::string& conversation_id);
 
     // Apply the model's chat template strictly via OGA (jinja), without the
     // text-only manual fallbacks. Required for multimodal models whose template
@@ -85,6 +105,26 @@ private:
     std::string resolveModelPath(const std::string& path);
     std::vector<int32_t> truncatePrompt(const std::vector<int32_t>& input_ids);
     bool validateModelDirectory(const std::string& path);
+
+    struct ChatSession {
+        std::unique_ptr<OgaGenerator> generator;
+        std::unique_ptr<OgaGeneratorParams> gen_params;
+        std::string cached_prefix;
+        size_t turn_count = 0;
+    };
+
+    ChatSession& getOrCreateChatSession(const std::string& conversation_id);
+    std::string extractDeltaPrompt(const std::string& full_prompt, const ChatSession& session) const;
+    void appendPromptText(OgaGenerator& generator, const std::string& text);
+    void configureGeneratorParams(OgaGeneratorParams& gen_params,
+                                  const GenerationParams& params,
+                                  int total_max_length) const;
+    std::string applyStopSequences(const std::string& text, const GenerationParams& params) const;
+    std::string updateCachedPrefixAfterTurn(const std::string& messages_json,
+                                            const std::string& assistant_output);
+    std::vector<int32_t> encodeText(const std::string& text) const;
+
+    std::unordered_map<std::string, ChatSession> chat_sessions_;
     
     std::unique_ptr<OgaModel> model_;
     std::unique_ptr<OgaTokenizer> tokenizer_;

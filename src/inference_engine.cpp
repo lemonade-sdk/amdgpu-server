@@ -8,10 +8,54 @@
 #include <cstdlib>
 #include <thread>
 #include <chrono>
+#include <iomanip>
+#include <ctime>
 
 namespace ryzenai {
 
 namespace fs = std::filesystem;
+
+namespace {
+
+void writeAppendDebugFile(const std::string& label,
+                          const std::string& session_id,
+                          size_t turn_number,
+                          const std::string& text) {
+    const char* debug_dir_env = std::getenv("AMDGPU_DEBUG_DIR");
+    if (!debug_dir_env || debug_dir_env[0] == '\0') {
+        return;
+    }
+
+    try {
+        fs::path dir(debug_dir_env);
+        fs::create_directories(dir);
+
+        auto now = std::chrono::system_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+        std::time_t tt = std::chrono::system_clock::to_time_t(now);
+        std::tm local_tm{};
+        localtime_s(&local_tm, &tt);
+
+        std::ostringstream name;
+        name << "server_append_" << std::put_time(&local_tm, "%Y%m%d_%H%M%S")
+             << '_' << std::setw(3) << std::setfill('0') << ms.count()
+             << ".txt";
+
+        fs::path out = dir / name.str();
+        std::ofstream file(out);
+        file << "label=" << label << "\n";
+        file << "session=" << session_id << "\n";
+        file << "turn=" << turn_number << "\n";
+        file << "chars=" << text.length() << "\n";
+        file << "----text----\n";
+        file << text;
+        std::cout << "[InferenceEngine] Wrote append debug: " << out.string() << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "[WARNING] Failed to write append debug file: " << e.what() << std::endl;
+    }
+}
+
+}  // namespace
 
 InferenceEngine::InferenceEngine(const std::string& model_path, int ctx_size)
     : ctx_size_(ctx_size) {
@@ -125,7 +169,9 @@ GenerationParams InferenceEngine::getDefaultParams() const {
     return default_params_;
 }
 
-std::string InferenceEngine::applyChatTemplate(const std::string& messages_json, const std::string& tools_json) {
+std::string InferenceEngine::applyChatTemplate(const std::string& messages_json,
+                                               const std::string& tools_json,
+                                               bool add_generation_prompt) {
     // Parse messages
     json messages = json::parse(messages_json);
     std::ostringstream prompt;
@@ -145,7 +191,7 @@ std::string InferenceEngine::applyChatTemplate(const std::string& messages_json,
                 template_str,
                 messages_json.c_str(),
                 tools_str,
-                true
+                add_generation_prompt
             );
             
             std::cout << "[InferenceEngine] Applied chat template with tools" << std::endl;
@@ -165,8 +211,9 @@ std::string InferenceEngine::applyChatTemplate(const std::string& messages_json,
                    << content << "<|im_end|>\n";
         }
         
-        // Add generation prompt for assistant
-        prompt << "<|im_start|>assistant\n";
+        if (add_generation_prompt) {
+            prompt << "<|im_start|>assistant\n";
+        }
         
         std::cout << "[InferenceEngine] Applied Qwen/ChatML template" << std::endl;
     } else {
@@ -178,7 +225,7 @@ std::string InferenceEngine::applyChatTemplate(const std::string& messages_json,
                 template_str,
                 messages_json.c_str(),
                 nullptr,
-                true
+                add_generation_prompt
             );
             
             return std::string(result);
@@ -202,7 +249,9 @@ std::string InferenceEngine::applyChatTemplate(const std::string& messages_json,
                 }
             }
             
-            prompt << "Assistant: ";
+            if (add_generation_prompt) {
+                prompt << "Assistant: ";
+            }
         }
     }
     
@@ -699,6 +748,285 @@ int InferenceEngine::countTokens(const std::string& text) {
     } catch (const std::exception& e) {
         std::cerr << "[WARNING] Failed to count tokens: " << e.what() << std::endl;
         return 0;
+    }
+}
+
+std::vector<int32_t> InferenceEngine::encodeText(const std::string& text) const {
+    auto sequences = OgaSequences::Create();
+    tokenizer_->Encode(text.c_str(), *sequences);
+    const int32_t* input_ids_ptr = sequences->SequenceData(0);
+    size_t input_ids_count = sequences->SequenceCount(0);
+    return std::vector<int32_t>(input_ids_ptr, input_ids_ptr + input_ids_count);
+}
+
+void InferenceEngine::appendPromptText(OgaGenerator& generator, const std::string& text) {
+    if (text.empty()) {
+        return;
+    }
+    std::vector<int32_t> input_ids = encodeText(text);
+    generator.AppendTokens(input_ids.data(), input_ids.size());
+}
+
+void InferenceEngine::configureGeneratorParams(OgaGeneratorParams& gen_params,
+                                               const GenerationParams& params,
+                                               int total_max_length) const {
+    gen_params.SetSearchOption("max_length", total_max_length);
+    gen_params.SetSearchOption("temperature", params.temperature);
+    gen_params.SetSearchOption("top_p", params.top_p);
+    gen_params.SetSearchOption("top_k", static_cast<double>(params.top_k));
+    gen_params.SetSearchOption("repetition_penalty", params.repetition_penalty);
+    gen_params.SetSearchOptionBool("do_sample", params.do_sample);
+    gen_params.SetSearchOption("random_seed", 1.0);
+}
+
+std::string InferenceEngine::applyStopSequences(const std::string& text,
+                                                const GenerationParams& params) const {
+    std::string result = text;
+    for (const auto& stop_seq : params.stop_sequences) {
+        size_t pos = result.find(stop_seq);
+        if (pos != std::string::npos) {
+            result = result.substr(0, pos);
+            break;
+        }
+    }
+    return result;
+}
+
+std::string InferenceEngine::updateCachedPrefixAfterTurn(const std::string& messages_json,
+                                                         const std::string& assistant_output) {
+    json messages = json::parse(messages_json);
+    messages.push_back({{"role", "assistant"}, {"content", assistant_output}});
+    return applyChatTemplate(messages.dump(), "", false);
+}
+
+InferenceEngine::ChatSession& InferenceEngine::getOrCreateChatSession(const std::string& conversation_id) {
+    auto it = chat_sessions_.find(conversation_id);
+    if (it != chat_sessions_.end()) {
+        return it->second;
+    }
+
+    ChatSession session;
+    session.gen_params = OgaGeneratorParams::Create(*model_);
+    session.generator = OgaGenerator::Create(*model_, *session.gen_params);
+    session.turn_count = 0;
+    session.cached_prefix.clear();
+
+    auto [inserted_it, inserted] = chat_sessions_.emplace(conversation_id, std::move(session));
+    if (!inserted) {
+        throw std::runtime_error("Failed to create chat session: " + conversation_id);
+    }
+
+    std::cout << "[InferenceEngine] Created multi-turn session: " << conversation_id << std::endl;
+    return inserted_it->second;
+}
+
+std::string InferenceEngine::extractDeltaPrompt(const std::string& full_prompt,
+                                                const ChatSession& session) const {
+    if (session.cached_prefix.empty()) {
+        return full_prompt;
+    }
+
+    if (full_prompt.size() < session.cached_prefix.size() ||
+        full_prompt.compare(0, session.cached_prefix.size(), session.cached_prefix) != 0) {
+        throw std::runtime_error(
+            "Multi-turn prefix mismatch: full prompt does not extend session cached prefix. "
+            "Ensure assistant history matches prior model output, or restart the server.");
+    }
+
+    return full_prompt.substr(session.cached_prefix.size());
+}
+
+void InferenceEngine::resetMultiTurnSession(const std::string& conversation_id) {
+    std::lock_guard<std::mutex> lock(inference_mutex_);
+    chat_sessions_.erase(conversation_id);
+    std::cout << "[InferenceEngine] Reset multi-turn session: " << conversation_id << std::endl;
+}
+
+std::string InferenceEngine::completeMultiTurn(const std::string& conversation_id,
+                                               const std::string& messages_json,
+                                               const GenerationParams& params,
+                                               CompletionTimingData* out_timing) {
+    std::lock_guard<std::mutex> lock(inference_mutex_);
+
+    try {
+        const std::string full_prompt = applyChatTemplate(messages_json, "", true);
+        ChatSession& session = getOrCreateChatSession(conversation_id);
+        const bool is_first_turn = (session.turn_count == 0);
+        const std::string delta_prompt = extractDeltaPrompt(full_prompt, session);
+
+        if (!is_first_turn && delta_prompt.empty()) {
+            throw std::runtime_error("Multi-turn request produced an empty delta prompt");
+        }
+
+        const std::string text_to_append = is_first_turn ? full_prompt : delta_prompt;
+        const int append_token_count = countTokens(text_to_append);
+
+        std::cout << "[InferenceEngine] Multi-turn turn=" << (session.turn_count + 1)
+                  << " session=" << conversation_id
+                  << " mode=" << (is_first_turn ? "APPEND_FULL" : "APPEND_DELTA")
+                  << " append_chars=" << text_to_append.length()
+                  << " append_tokens=" << append_token_count
+                  << " full_tokens=" << countTokens(full_prompt)
+                  << " cached_chars=" << session.cached_prefix.length() << std::endl;
+        if (!is_first_turn) {
+            std::cout << "[InferenceEngine] Multi-turn delta (first 200): "
+                      << delta_prompt.substr(0, std::min(size_t(200), delta_prompt.length()))
+                      << std::endl;
+        }
+
+        writeAppendDebugFile(is_first_turn ? "APPEND_FULL" : "APPEND_DELTA",
+                             conversation_id,
+                             session.turn_count + 1,
+                             text_to_append);
+
+        const size_t seq_before = session.generator->GetSequenceCount(0);
+        appendPromptText(*session.generator, text_to_append);
+
+        int total_max_length = static_cast<int>(session.generator->GetSequenceCount(0)) + params.max_length;
+        if (model_context_length_ > 0 && total_max_length > model_context_length_) {
+            total_max_length = model_context_length_;
+        }
+        configureGeneratorParams(*session.gen_params, params, total_max_length);
+
+        auto start_time = std::chrono::high_resolution_clock::now();
+        auto first_token_time = start_time;
+        bool first_token_received = false;
+
+        while (!session.generator->IsDone()) {
+            session.generator->GenerateNextToken();
+            if (!first_token_received) {
+                first_token_time = std::chrono::high_resolution_clock::now();
+                first_token_received = true;
+            }
+        }
+
+        auto end_time = std::chrono::high_resolution_clock::now();
+        const int32_t* output_ptr = session.generator->GetSequenceData(0);
+        const size_t output_count = session.generator->GetSequenceCount(0);
+        const int generated_token_count = (output_count > seq_before)
+            ? static_cast<int>(output_count - seq_before)
+            : 0;
+
+        std::string result;
+        if (output_count > seq_before) {
+            auto decoded = tokenizer_->Decode(output_ptr + seq_before, output_count - seq_before);
+            result = applyStopSequences(std::string(decoded), params);
+        }
+
+        session.cached_prefix = updateCachedPrefixAfterTurn(messages_json, result);
+        session.turn_count++;
+
+        if (out_timing != nullptr) {
+            auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+            auto ttft_duration = std::chrono::duration_cast<std::chrono::milliseconds>(first_token_time - start_time);
+            const double ttft_seconds = ttft_duration.count() / 1000.0;
+            const double total_time_ms = static_cast<double>(total_duration.count());
+            const double decode_time_seconds = (total_duration.count() - ttft_duration.count()) / 1000.0;
+            double tps = 0.0;
+            if (generated_token_count > 1 && decode_time_seconds > 0) {
+                tps = (generated_token_count - 1) / decode_time_seconds;
+            } else if (generated_token_count == 1 && total_time_ms > 0) {
+                tps = 1.0 / (total_time_ms / 1000.0);
+            }
+
+            out_timing->token_count = generated_token_count;
+            out_timing->ttft_seconds = ttft_seconds;
+            out_timing->tps = tps;
+            out_timing->total_time_ms = total_time_ms;
+        }
+
+        std::cout << "[InferenceEngine] Multi-turn completed turn=" << session.turn_count
+                  << " generated=" << generated_token_count
+                  << " cached_prefix_len=" << session.cached_prefix.length()
+                  << " token_count=" << session.generator->TokenCount() << std::endl;
+
+        return result;
+    } catch (const std::exception& e) {
+        throw std::runtime_error("Multi-turn inference failed: " + std::string(e.what()));
+    }
+}
+
+void InferenceEngine::streamMultiTurn(const std::string& conversation_id,
+                                      const std::string& messages_json,
+                                      const GenerationParams& params,
+                                      StreamCallback callback) {
+    std::lock_guard<std::mutex> lock(inference_mutex_);
+
+    try {
+        const std::string full_prompt = applyChatTemplate(messages_json, "", true);
+        ChatSession& session = getOrCreateChatSession(conversation_id);
+        const bool is_first_turn = (session.turn_count == 0);
+        const std::string delta_prompt = extractDeltaPrompt(full_prompt, session);
+
+        if (!is_first_turn && delta_prompt.empty()) {
+            throw std::runtime_error("Multi-turn request produced an empty delta prompt");
+        }
+
+        const std::string text_to_append = is_first_turn ? full_prompt : delta_prompt;
+
+        std::cout << "[InferenceEngine] Multi-turn stream turn=" << (session.turn_count + 1)
+                  << " session=" << conversation_id
+                  << " mode=" << (is_first_turn ? "APPEND_FULL" : "APPEND_DELTA")
+                  << " append_tokens=" << countTokens(text_to_append) << std::endl;
+
+        writeAppendDebugFile(is_first_turn ? "APPEND_FULL" : "APPEND_DELTA",
+                             conversation_id,
+                             session.turn_count + 1,
+                             text_to_append);
+
+        appendPromptText(*session.generator, text_to_append);
+
+        int total_max_length = static_cast<int>(session.generator->GetSequenceCount(0)) + params.max_length;
+        if (model_context_length_ > 0 && total_max_length > model_context_length_) {
+            total_max_length = model_context_length_;
+        }
+        configureGeneratorParams(*session.gen_params, params, total_max_length);
+
+        auto tokenizer_stream = OgaTokenizerStream::Create(*tokenizer_);
+        std::string accumulated_output;
+        bool client_disconnected = false;
+
+        while (!session.generator->IsDone() && !client_disconnected) {
+            session.generator->GenerateNextToken();
+
+            const int32_t* all_tokens = session.generator->GetSequenceData(0);
+            const size_t num_tokens = session.generator->GetSequenceCount(0);
+            const int32_t new_token = all_tokens[num_tokens - 1];
+
+            const char* decoded = tokenizer_stream->Decode(new_token);
+            if (decoded && decoded[0] != '\0') {
+                std::string token_str(decoded);
+
+                bool should_stop = false;
+                for (const auto& stop_seq : params.stop_sequences) {
+                    std::string temp_output = accumulated_output + token_str;
+                    if (temp_output.find(stop_seq) != std::string::npos) {
+                        should_stop = true;
+                        break;
+                    }
+                }
+                if (should_stop) {
+                    break;
+                }
+
+                accumulated_output += token_str;
+                const bool is_final = session.generator->IsDone();
+                if (!callback(token_str, is_final)) {
+                    client_disconnected = true;
+                    break;
+                }
+            }
+        }
+
+        accumulated_output = applyStopSequences(accumulated_output, params);
+        session.cached_prefix = updateCachedPrefixAfterTurn(messages_json, accumulated_output);
+        session.turn_count++;
+
+        std::cout << "[InferenceEngine] Multi-turn stream completed turn=" << session.turn_count
+                  << " cached_prefix_len=" << session.cached_prefix.length()
+                  << " token_count=" << session.generator->TokenCount() << std::endl;
+    } catch (const std::exception& e) {
+        throw std::runtime_error("Multi-turn streaming failed: " + std::string(e.what()));
     }
 }
 

@@ -643,6 +643,11 @@ void RyzenAIServer::handleChatCompletions(const httplib::Request& req, httplib::
         std::string prompt = inference_engine_->applyChatTemplate(messages_array.dump(), tools_json);
         std::cout << "[Server DEBUG] Generated prompt length: " << prompt.length() << " chars" << std::endl;
         std::cout << "[Server DEBUG] Prompt (first 500 chars): " << prompt.substr(0, std::min(size_t(500), prompt.length())) << std::endl;
+
+        // Text chat always uses the single default multi-turn AppendTokens session.
+        // (Tool definitions in the request do not disable this; only post-hoc tool parsing.)
+        const bool use_multi_turn = true;
+        const std::string session_id = kDefaultConversationId;
         
         if (chat_req.stream) {
             // REAL-TIME STREAMING: Send chunks as tokens are generated
@@ -662,9 +667,12 @@ void RyzenAIServer::handleChatCompletions(const httplib::Request& req, httplib::
             // Count prompt tokens before streaming
             int prompt_tokens = inference_engine_->countTokens(prompt);
             
+            std::string messages_json = messages_array.dump();
+
             res.set_chunked_content_provider(
                 "text/event-stream",
-                [this, prompt, params, model_id, has_tools, prompt_tokens](size_t offset, httplib::DataSink& sink) {
+                [this, prompt, params, model_id, has_tools, prompt_tokens, use_multi_turn,
+                 session_id, messages_json](size_t offset, httplib::DataSink& sink) {
                     if (offset > 0) return false; // Only run once
                     
                     try {
@@ -680,8 +688,7 @@ void RyzenAIServer::handleChatCompletions(const httplib::Request& req, httplib::
                         // Create reasoning parser for streaming
                         ReasoningStreamParser reasoning_parser;
                         
-                        // Generate and send tokens in real-time
-                        inference_engine_->streamComplete(prompt, params, 
+                        StreamCallback stream_callback =
                             [&sink, model_id, &token_count, &full_response, &reasoning_parser, &first_token_received, &first_token_time](const std::string& token, bool is_final) -> bool {
                                 // Track time to first token
                                 if (!first_token_received && !token.empty()) {
@@ -793,8 +800,13 @@ void RyzenAIServer::handleChatCompletions(const httplib::Request& req, httplib::
                                 
                                 token_count++;
                                 return true; // Continue generation
-                            }
-                        );
+                            };
+
+                        if (use_multi_turn) {
+                            inference_engine_->streamMultiTurn(session_id, messages_json, params, stream_callback);
+                        } else {
+                            inference_engine_->streamComplete(prompt, params, stream_callback);
+                        }
                         
                         // After generation completes, do a final flush to catch any remaining buffered content
                         // This handles the case where the last few tokens didn't trigger processing due to buffer size
@@ -938,7 +950,16 @@ void RyzenAIServer::handleChatCompletions(const httplib::Request& req, httplib::
             );
             
             CompletionTimingData timing;
-            std::string output = inference_engine_->complete(prompt, params, &timing);
+            std::string output;
+            if (use_multi_turn) {
+                output = inference_engine_->completeMultiTurn(
+                    session_id,
+                    messages_array.dump(),
+                    params,
+                    &timing);
+            } else {
+                output = inference_engine_->complete(prompt, params, &timing);
+            }
             
             // Parse reasoning content from output
             auto reasoning_result = parseReasoningContent(output);

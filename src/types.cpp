@@ -140,6 +140,10 @@ ChatCompletionRequest ChatCompletionRequest::fromJSON(const json& j) {
     if (j.contains("tools")) {
         req.tools = j["tools"];
     }
+
+    if (j.contains("conversation_id") && j["conversation_id"].is_string()) {
+        req.conversation_id = j["conversation_id"];
+    }
     
     return req;
 }
