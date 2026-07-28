@@ -825,6 +825,10 @@ InferenceEngine::ChatSession& InferenceEngine::getOrCreateChatSession(const std:
 
 void InferenceEngine::resetMultiTurnSession(const std::string& conversation_id) {
     std::lock_guard<std::mutex> lock(inference_mutex_);
+    resetMultiTurnSessionLocked(conversation_id);
+}
+
+void InferenceEngine::resetMultiTurnSessionLocked(const std::string& conversation_id) {
     auto it = chat_sessions_.find(conversation_id);
     if (it == chat_sessions_.end()) {
         std::cout << "[InferenceEngine] Reset multi-turn session: " << conversation_id
@@ -1088,6 +1092,258 @@ void apply_search_options(OgaGeneratorParams& gen_params, const GenerationParams
     gen_params.SetSearchOption("random_seed", 1.0);
 }
 }  // namespace
+
+namespace {
+
+std::unique_ptr<OgaImages> loadOgaImages(const std::vector<std::string>& images) {
+    if (images.empty()) {
+        return nullptr;
+    }
+    std::vector<const void*> data_ptrs;
+    std::vector<size_t> data_sizes;
+    data_ptrs.reserve(images.size());
+    data_sizes.reserve(images.size());
+    for (const auto& img : images) {
+        data_ptrs.push_back(img.data());
+        data_sizes.push_back(img.size());
+    }
+    return OgaImages::Load(data_ptrs.data(), data_sizes.data(), data_ptrs.size());
+}
+
+}  // namespace
+
+std::string InferenceEngine::completeMultiTurnMultimodal(const std::string& conversation_id,
+                                                         const std::string& messages_json,
+                                                         const std::vector<std::string>& new_turn_images,
+                                                         const std::vector<std::string>& all_images,
+                                                         const std::string& tools_json,
+                                                         const GenerationParams& params,
+                                                         CompletionTimingData* out_timing) {
+    std::lock_guard<std::mutex> lock(inference_mutex_);
+    if (!processor_) {
+        throw std::runtime_error("Multimodal multi-turn requested but model is not multimodal");
+    }
+
+    try {
+        const std::string full_prompt = applyChatTemplateRaw(messages_json, tools_json);
+        bool is_first_turn = true;
+        if (auto it = chat_sessions_.find(conversation_id); it != chat_sessions_.end()) {
+            is_first_turn = (it->second.turn_count == 0);
+        }
+
+        if (!is_first_turn && !new_turn_images.empty()) {
+            std::cout << "[InferenceEngine] Multimodal multi-turn: new images on follow-up turn, "
+                      << "resetting session and reprocessing full prompt" << std::endl;
+            chat_sessions_.erase(conversation_id);
+            is_first_turn = true;
+        }
+
+        ChatSession& active_session = getOrCreateChatSession(conversation_id);
+        const std::string text_to_append = is_first_turn
+            ? full_prompt
+            : extractDeltaPromptFromLastUser(full_prompt);
+
+        if (text_to_append.empty()) {
+            throw std::runtime_error("Multimodal multi-turn request produced an empty prompt segment");
+        }
+
+        const std::vector<std::string>& images_for_process =
+            is_first_turn ? all_images : new_turn_images;
+
+        std::cout << "[InferenceEngine] Multimodal multi-turn turn=" << (active_session.turn_count + 1)
+                  << " session=" << conversation_id
+                  << " mode=" << (is_first_turn ? "APPEND_FULL" : "APPEND_DELTA")
+                  << " append_chars=" << text_to_append.length()
+                  << " append_tokens=" << countTokens(text_to_append)
+                  << " new_turn_images=" << new_turn_images.size()
+                  << " process_images=" << images_for_process.size()
+                  << " full_tokens=" << countTokens(full_prompt) << std::endl;
+
+        writeAppendDebugFile(is_first_turn ? "APPEND_FULL" : "APPEND_DELTA",
+                             conversation_id,
+                             active_session.turn_count + 1,
+                             text_to_append);
+
+        const size_t seq_before = active_session.generator->GetSequenceCount(0);
+
+        if (is_first_turn && !images_for_process.empty()) {
+            auto oga_images = loadOgaImages(images_for_process);
+            auto inputs = processor_->ProcessImages(text_to_append.c_str(), oga_images.get());
+            active_session.generator->SetInputs(*inputs);
+        } else {
+            appendPromptText(*active_session.generator, text_to_append);
+        }
+
+        int total_max_length = static_cast<int>(active_session.generator->GetSequenceCount(0)) + params.max_length;
+        if (model_context_length_ > 0 && total_max_length > model_context_length_) {
+            total_max_length = model_context_length_;
+        }
+        configureGeneratorParams(*active_session.gen_params, params, total_max_length);
+
+        auto start_time = std::chrono::high_resolution_clock::now();
+        auto first_token_time = start_time;
+        bool first_token_received = false;
+
+        while (!active_session.generator->IsDone()) {
+            active_session.generator->GenerateNextToken();
+            if (!first_token_received) {
+                first_token_time = std::chrono::high_resolution_clock::now();
+                first_token_received = true;
+            }
+        }
+
+        auto end_time = std::chrono::high_resolution_clock::now();
+        const int32_t* output_ptr = active_session.generator->GetSequenceData(0);
+        const size_t output_count = active_session.generator->GetSequenceCount(0);
+        const int generated_token_count = (output_count > seq_before)
+            ? static_cast<int>(output_count - seq_before)
+            : 0;
+
+        std::string result;
+        if (output_count > seq_before) {
+            auto decoded = processor_->Decode(output_ptr + seq_before, output_count - seq_before);
+            result = applyStopSequences(std::string(decoded), params);
+        }
+
+        active_session.turn_count++;
+
+        if (out_timing != nullptr) {
+            auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+            auto ttft_duration = std::chrono::duration_cast<std::chrono::milliseconds>(first_token_time - start_time);
+            const double ttft_seconds = ttft_duration.count() / 1000.0;
+            const double total_time_ms = static_cast<double>(total_duration.count());
+            const double decode_time_seconds = (total_duration.count() - ttft_duration.count()) / 1000.0;
+            double tps = 0.0;
+            if (generated_token_count > 1 && decode_time_seconds > 0) {
+                tps = (generated_token_count - 1) / decode_time_seconds;
+            } else if (generated_token_count == 1 && total_time_ms > 0) {
+                tps = 1.0 / (total_time_ms / 1000.0);
+            }
+
+            out_timing->token_count = generated_token_count;
+            out_timing->ttft_seconds = ttft_seconds;
+            out_timing->tps = tps;
+            out_timing->total_time_ms = total_time_ms;
+        }
+
+        std::cout << "[InferenceEngine] Multimodal multi-turn completed turn=" << active_session.turn_count
+                  << " generated=" << generated_token_count << std::endl;
+        return result;
+    } catch (const std::exception& e) {
+        throw std::runtime_error("Multimodal multi-turn inference failed: " + std::string(e.what()));
+    }
+}
+
+void InferenceEngine::streamMultiTurnMultimodal(const std::string& conversation_id,
+                                                const std::string& messages_json,
+                                                const std::vector<std::string>& new_turn_images,
+                                                const std::vector<std::string>& all_images,
+                                                const std::string& tools_json,
+                                                const GenerationParams& params,
+                                                StreamCallback callback) {
+    std::lock_guard<std::mutex> lock(inference_mutex_);
+    if (!processor_) {
+        throw std::runtime_error("Multimodal multi-turn requested but model is not multimodal");
+    }
+
+    try {
+        const std::string full_prompt = applyChatTemplateRaw(messages_json, tools_json);
+        bool is_first_turn = true;
+        if (auto it = chat_sessions_.find(conversation_id); it != chat_sessions_.end()) {
+            is_first_turn = (it->second.turn_count == 0);
+        }
+
+        if (!is_first_turn && !new_turn_images.empty()) {
+            std::cout << "[InferenceEngine] Multimodal multi-turn stream: new images on follow-up turn, "
+                      << "resetting session and reprocessing full prompt" << std::endl;
+            chat_sessions_.erase(conversation_id);
+            is_first_turn = true;
+        }
+
+        ChatSession& session = getOrCreateChatSession(conversation_id);
+
+        const std::string text_to_append = is_first_turn
+            ? full_prompt
+            : extractDeltaPromptFromLastUser(full_prompt);
+
+        if (text_to_append.empty()) {
+            throw std::runtime_error("Multimodal multi-turn request produced an empty prompt segment");
+        }
+
+        const std::vector<std::string>& images_for_process =
+            is_first_turn ? all_images : new_turn_images;
+
+        std::cout << "[InferenceEngine] Multimodal multi-turn stream turn=" << (session.turn_count + 1)
+                  << " session=" << conversation_id
+                  << " mode=" << (is_first_turn ? "APPEND_FULL" : "APPEND_DELTA")
+                  << " append_tokens=" << countTokens(text_to_append)
+                  << " new_turn_images=" << new_turn_images.size()
+                  << " process_images=" << images_for_process.size() << std::endl;
+
+        writeAppendDebugFile(is_first_turn ? "APPEND_FULL" : "APPEND_DELTA",
+                             conversation_id,
+                             session.turn_count + 1,
+                             text_to_append);
+
+        if (is_first_turn && !images_for_process.empty()) {
+            auto oga_images = loadOgaImages(images_for_process);
+            auto inputs = processor_->ProcessImages(text_to_append.c_str(), oga_images.get());
+            session.generator->SetInputs(*inputs);
+        } else {
+            appendPromptText(*session.generator, text_to_append);
+        }
+
+        int total_max_length = static_cast<int>(session.generator->GetSequenceCount(0)) + params.max_length;
+        if (model_context_length_ > 0 && total_max_length > model_context_length_) {
+            total_max_length = model_context_length_;
+        }
+        configureGeneratorParams(*session.gen_params, params, total_max_length);
+
+        auto tokenizer_stream = OgaTokenizerStream::Create(*processor_);
+        std::string accumulated_output;
+        bool client_disconnected = false;
+
+        while (!session.generator->IsDone() && !client_disconnected) {
+            session.generator->GenerateNextToken();
+
+            const int32_t* all_tokens = session.generator->GetSequenceData(0);
+            const size_t num_tokens = session.generator->GetSequenceCount(0);
+            const int32_t new_token = all_tokens[num_tokens - 1];
+
+            const char* decoded = tokenizer_stream->Decode(new_token);
+            if (decoded && decoded[0] != '\0') {
+                std::string token_str(decoded);
+
+                bool should_stop = false;
+                for (const auto& stop_seq : params.stop_sequences) {
+                    std::string temp_output = accumulated_output + token_str;
+                    if (temp_output.find(stop_seq) != std::string::npos) {
+                        should_stop = true;
+                        break;
+                    }
+                }
+                if (should_stop) {
+                    break;
+                }
+
+                accumulated_output += token_str;
+                const bool is_final = session.generator->IsDone();
+                if (!callback(token_str, is_final)) {
+                    client_disconnected = true;
+                    break;
+                }
+            }
+        }
+
+        accumulated_output = applyStopSequences(accumulated_output, params);
+        session.turn_count++;
+
+        std::cout << "[InferenceEngine] Multimodal multi-turn stream completed turn="
+                  << session.turn_count << std::endl;
+    } catch (const std::exception& e) {
+        throw std::runtime_error("Multimodal multi-turn streaming failed: " + std::string(e.what()));
+    }
+}
 
 std::string InferenceEngine::completeMultimodal(const std::string& prompt,
                                                 const std::vector<std::string>& images,

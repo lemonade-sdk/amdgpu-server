@@ -63,6 +63,24 @@ public:
 
     void resetMultiTurnSession(const std::string& conversation_id);
 
+    // Multi-turn VLM: reuse ChatSession KV cache; turn 1 may SetInputs (vision),
+    // later text-only turns append delta from last <|im_start|>user via jinja template.
+    std::string completeMultiTurnMultimodal(const std::string& conversation_id,
+                                            const std::string& messages_json,
+                                            const std::vector<std::string>& new_turn_images,
+                                            const std::vector<std::string>& all_images,
+                                            const std::string& tools_json,
+                                            const GenerationParams& params,
+                                            CompletionTimingData* out_timing = nullptr);
+
+    void streamMultiTurnMultimodal(const std::string& conversation_id,
+                                   const std::string& messages_json,
+                                   const std::vector<std::string>& new_turn_images,
+                                   const std::vector<std::string>& all_images,
+                                   const std::string& tools_json,
+                                   const GenerationParams& params,
+                                   StreamCallback callback);
+
     // Apply the model's chat template strictly via OGA (jinja), without the
     // text-only manual fallbacks. Required for multimodal models whose template
     // expands image placeholders (e.g. <|vision_start|><|image_pad|><|vision_end|>).
@@ -113,6 +131,7 @@ private:
     };
 
     ChatSession& getOrCreateChatSession(const std::string& conversation_id);
+    void resetMultiTurnSessionLocked(const std::string& conversation_id);
     // Extract the latest user turn from full prompt: suffix starting at last <|im_start|>user.
     std::string extractDeltaPromptFromLastUser(const std::string& full_prompt) const;
     void appendPromptText(OgaGenerator& generator, const std::string& text);
