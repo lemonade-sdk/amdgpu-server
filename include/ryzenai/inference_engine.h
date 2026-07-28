@@ -109,19 +109,17 @@ private:
     struct ChatSession {
         std::unique_ptr<OgaGenerator> generator;
         std::unique_ptr<OgaGeneratorParams> gen_params;
-        std::string cached_prefix;
         size_t turn_count = 0;
     };
 
     ChatSession& getOrCreateChatSession(const std::string& conversation_id);
-    std::string extractDeltaPrompt(const std::string& full_prompt, const ChatSession& session) const;
+    // Extract the latest user turn from full prompt: suffix starting at last <|im_start|>user.
+    std::string extractDeltaPromptFromLastUser(const std::string& full_prompt) const;
     void appendPromptText(OgaGenerator& generator, const std::string& text);
     void configureGeneratorParams(OgaGeneratorParams& gen_params,
                                   const GenerationParams& params,
                                   int total_max_length) const;
     std::string applyStopSequences(const std::string& text, const GenerationParams& params) const;
-    std::string updateCachedPrefixAfterTurn(const std::string& messages_json,
-                                            const std::string& assistant_output);
     std::vector<int32_t> encodeText(const std::string& text) const;
 
     std::unordered_map<std::string, ChatSession> chat_sessions_;

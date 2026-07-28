@@ -792,11 +792,15 @@ std::string InferenceEngine::applyStopSequences(const std::string& text,
     return result;
 }
 
-std::string InferenceEngine::updateCachedPrefixAfterTurn(const std::string& messages_json,
-                                                         const std::string& assistant_output) {
-    json messages = json::parse(messages_json);
-    messages.push_back({{"role", "assistant"}, {"content", assistant_output}});
-    return applyChatTemplate(messages.dump(), "", false);
+std::string InferenceEngine::extractDeltaPromptFromLastUser(const std::string& full_prompt) const {
+    static constexpr const char* kUserTurnMarker = "<|im_start|>user";
+    const size_t pos = full_prompt.rfind(kUserTurnMarker);
+    if (pos == std::string::npos) {
+        throw std::runtime_error(
+            std::string("Multi-turn: could not find latest user turn marker '") + kUserTurnMarker +
+            "' in full prompt");
+    }
+    return full_prompt.substr(pos);
 }
 
 InferenceEngine::ChatSession& InferenceEngine::getOrCreateChatSession(const std::string& conversation_id) {
@@ -809,7 +813,6 @@ InferenceEngine::ChatSession& InferenceEngine::getOrCreateChatSession(const std:
     session.gen_params = OgaGeneratorParams::Create(*model_);
     session.generator = OgaGenerator::Create(*model_, *session.gen_params);
     session.turn_count = 0;
-    session.cached_prefix.clear();
 
     auto [inserted_it, inserted] = chat_sessions_.emplace(conversation_id, std::move(session));
     if (!inserted) {
@@ -818,22 +821,6 @@ InferenceEngine::ChatSession& InferenceEngine::getOrCreateChatSession(const std:
 
     std::cout << "[InferenceEngine] Created multi-turn session: " << conversation_id << std::endl;
     return inserted_it->second;
-}
-
-std::string InferenceEngine::extractDeltaPrompt(const std::string& full_prompt,
-                                                const ChatSession& session) const {
-    if (session.cached_prefix.empty()) {
-        return full_prompt;
-    }
-
-    if (full_prompt.size() < session.cached_prefix.size() ||
-        full_prompt.compare(0, session.cached_prefix.size(), session.cached_prefix) != 0) {
-        throw std::runtime_error(
-            "Multi-turn prefix mismatch: full prompt does not extend session cached prefix. "
-            "Ensure assistant history matches prior model output, or restart the server.");
-    }
-
-    return full_prompt.substr(session.cached_prefix.size());
 }
 
 void InferenceEngine::resetMultiTurnSession(const std::string& conversation_id) {
@@ -852,13 +839,15 @@ std::string InferenceEngine::completeMultiTurn(const std::string& conversation_i
         const std::string full_prompt = applyChatTemplate(messages_json, "", true);
         ChatSession& session = getOrCreateChatSession(conversation_id);
         const bool is_first_turn = (session.turn_count == 0);
-        const std::string delta_prompt = extractDeltaPrompt(full_prompt, session);
+        const std::string delta_prompt = is_first_turn
+            ? full_prompt
+            : extractDeltaPromptFromLastUser(full_prompt);
+        const std::string text_to_append = delta_prompt;
 
-        if (!is_first_turn && delta_prompt.empty()) {
+        if (!is_first_turn && text_to_append.empty()) {
             throw std::runtime_error("Multi-turn request produced an empty delta prompt");
         }
 
-        const std::string text_to_append = is_first_turn ? full_prompt : delta_prompt;
         const int append_token_count = countTokens(text_to_append);
 
         std::cout << "[InferenceEngine] Multi-turn turn=" << (session.turn_count + 1)
@@ -866,11 +855,10 @@ std::string InferenceEngine::completeMultiTurn(const std::string& conversation_i
                   << " mode=" << (is_first_turn ? "APPEND_FULL" : "APPEND_DELTA")
                   << " append_chars=" << text_to_append.length()
                   << " append_tokens=" << append_token_count
-                  << " full_tokens=" << countTokens(full_prompt)
-                  << " cached_chars=" << session.cached_prefix.length() << std::endl;
+                  << " full_tokens=" << countTokens(full_prompt) << std::endl;
         if (!is_first_turn) {
             std::cout << "[InferenceEngine] Multi-turn delta (first 200): "
-                      << delta_prompt.substr(0, std::min(size_t(200), delta_prompt.length()))
+                      << text_to_append.substr(0, std::min(size_t(200), text_to_append.length()))
                       << std::endl;
         }
 
@@ -913,7 +901,6 @@ std::string InferenceEngine::completeMultiTurn(const std::string& conversation_i
             result = applyStopSequences(std::string(decoded), params);
         }
 
-        session.cached_prefix = updateCachedPrefixAfterTurn(messages_json, result);
         session.turn_count++;
 
         if (out_timing != nullptr) {
@@ -937,7 +924,6 @@ std::string InferenceEngine::completeMultiTurn(const std::string& conversation_i
 
         std::cout << "[InferenceEngine] Multi-turn completed turn=" << session.turn_count
                   << " generated=" << generated_token_count
-                  << " cached_prefix_len=" << session.cached_prefix.length()
                   << " token_count=" << session.generator->TokenCount() << std::endl;
 
         return result;
@@ -956,13 +942,13 @@ void InferenceEngine::streamMultiTurn(const std::string& conversation_id,
         const std::string full_prompt = applyChatTemplate(messages_json, "", true);
         ChatSession& session = getOrCreateChatSession(conversation_id);
         const bool is_first_turn = (session.turn_count == 0);
-        const std::string delta_prompt = extractDeltaPrompt(full_prompt, session);
+        const std::string text_to_append = is_first_turn
+            ? full_prompt
+            : extractDeltaPromptFromLastUser(full_prompt);
 
-        if (!is_first_turn && delta_prompt.empty()) {
+        if (!is_first_turn && text_to_append.empty()) {
             throw std::runtime_error("Multi-turn request produced an empty delta prompt");
         }
-
-        const std::string text_to_append = is_first_turn ? full_prompt : delta_prompt;
 
         std::cout << "[InferenceEngine] Multi-turn stream turn=" << (session.turn_count + 1)
                   << " session=" << conversation_id
@@ -1019,11 +1005,9 @@ void InferenceEngine::streamMultiTurn(const std::string& conversation_id,
         }
 
         accumulated_output = applyStopSequences(accumulated_output, params);
-        session.cached_prefix = updateCachedPrefixAfterTurn(messages_json, accumulated_output);
         session.turn_count++;
 
         std::cout << "[InferenceEngine] Multi-turn stream completed turn=" << session.turn_count
-                  << " cached_prefix_len=" << session.cached_prefix.length()
                   << " token_count=" << session.generator->TokenCount() << std::endl;
     } catch (const std::exception& e) {
         throw std::runtime_error("Multi-turn streaming failed: " + std::string(e.what()));
