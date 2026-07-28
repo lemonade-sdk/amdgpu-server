@@ -825,8 +825,24 @@ InferenceEngine::ChatSession& InferenceEngine::getOrCreateChatSession(const std:
 
 void InferenceEngine::resetMultiTurnSession(const std::string& conversation_id) {
     std::lock_guard<std::mutex> lock(inference_mutex_);
-    chat_sessions_.erase(conversation_id);
-    std::cout << "[InferenceEngine] Reset multi-turn session: " << conversation_id << std::endl;
+    auto it = chat_sessions_.find(conversation_id);
+    if (it == chat_sessions_.end()) {
+        std::cout << "[InferenceEngine] Reset multi-turn session: " << conversation_id
+                  << " (no existing session, no-op)" << std::endl;
+        return;
+    }
+
+    ChatSession& session = it->second;
+    try {
+        session.generator->RewindTo(0);
+        session.turn_count = 0;
+        std::cout << "[InferenceEngine] Reset multi-turn session: " << conversation_id
+                  << " (RewindTo(0), turn_count=0)" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "[InferenceEngine] RewindTo(0) failed for session " << conversation_id
+                  << ", recreating generator: " << e.what() << std::endl;
+        chat_sessions_.erase(it);
+    }
 }
 
 std::string InferenceEngine::completeMultiTurn(const std::string& conversation_id,

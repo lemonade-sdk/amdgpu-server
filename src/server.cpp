@@ -221,6 +221,10 @@ void RyzenAIServer::setupRoutes() {
     http_server_->Post("/v1/responses", [this](const httplib::Request& req, httplib::Response& res) {
         handleResponses(req, res);
     });
+
+    http_server_->Post("/v1/sessions/reset", [this](const httplib::Request& req, httplib::Response& res) {
+        handleSessionReset(req, res);
+    });
     
     // Root redirect
     http_server_->Get("/", [this](const httplib::Request&, httplib::Response& res) {
@@ -232,7 +236,8 @@ void RyzenAIServer::setupRoutes() {
                 "/health",
                 "/v1/completions",
                 "/v1/chat/completions",
-                "/v1/responses"
+                "/v1/responses",
+                "/v1/sessions/reset"
             }}
         };
         res.set_content(response.dump(2), "application/json");
@@ -261,6 +266,32 @@ void RyzenAIServer::handleHealth(const httplib::Request& req, httplib::Response&
     };
     
     res.set_content(response.dump(2), "application/json");
+}
+
+void RyzenAIServer::handleSessionReset(const httplib::Request& req, httplib::Response& res) {
+    try {
+        std::string conversation_id = kDefaultConversationId;
+        if (!req.body.empty()) {
+            json request_json = json::parse(req.body);
+            if (request_json.contains("conversation_id") &&
+                request_json["conversation_id"].is_string()) {
+                conversation_id = request_json["conversation_id"].get<std::string>();
+            }
+        }
+
+        inference_engine_->resetMultiTurnSession(conversation_id);
+
+        json response = {
+            {"status", "success"},
+            {"conversation_id", conversation_id},
+            {"message", "Chat session KV cache reset"}
+        };
+        res.set_content(response.dump(), "application/json");
+    } catch (const std::exception& e) {
+        res.status = 500;
+        res.set_content(createErrorResponse(e.what(), "session_reset_error").dump(),
+                        "application/json");
+    }
 }
 
 void RyzenAIServer::handleCompletions(const httplib::Request& req, httplib::Response& res) {
@@ -1176,6 +1207,7 @@ void RyzenAIServer::run() {
     std::cout << "  GET  http://" << args_.host << ":" << args_.port << "/health\n";
     std::cout << "  POST http://" << args_.host << ":" << args_.port << "/v1/completions\n";
     std::cout << "  POST http://" << args_.host << ":" << args_.port << "/v1/chat/completions\n";
+    std::cout << "  POST http://" << args_.host << ":" << args_.port << "/v1/sessions/reset\n";
     std::cout << "\n";
     std::cout << "Press Ctrl+C to stop the server\n";
     std::cout << "===============================================================\n\n";

@@ -35,7 +35,8 @@ private:
     void handleMultimodalChat(const json& request_json, const ChatCompletionRequest& chat_req,
                               const std::vector<std::string>& images, httplib::Response& res);
     void handleResponses(const httplib::Request& req, httplib::Response& res);
-    
+    void handleSessionReset(const httplib::Request& req, httplib::Response& res);
+
     // Helper methods
     json createErrorResponse(const std::string& message, const std::string& type);
     void setupCORS(httplib::Response& res);
