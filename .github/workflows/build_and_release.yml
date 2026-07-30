@@ -41,13 +41,17 @@ jobs:
       # ----------------------------- Windows -----------------------------
       - name: (win) Download hip-ep gpu-test-package
         if: runner.os == 'Windows'
-        shell: pwsh
+        shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
+          # Windows PowerShell 5.1: disabling the progress bar makes large
+          # Invoke-WebRequest downloads fast instead of crawling.
+          $ProgressPreference = "SilentlyContinue"
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
           $ver = "${{ env.HIP_EP_VERSION }}"
           $url = "https://github.com/ROCm/hip-ep/releases/download/$ver/gpu-test-package-windows-$ver.zip"
           Write-Host "Downloading $url"
-          Invoke-WebRequest -Uri $url -OutFile pkg.zip
+          Invoke-WebRequest -Uri $url -OutFile pkg.zip -UseBasicParsing
           if (Test-Path pkg) { Remove-Item -Recurse -Force pkg }
           Expand-Archive -Path pkg.zip -DestinationPath pkg -Force
           $dll = Get-ChildItem -Path pkg -Recurse -Filter onnxruntime-genai.dll | Select-Object -First 1
@@ -56,7 +60,7 @@ jobs:
 
       - name: (win) Configure & build
         if: runner.os == 'Windows'
-        shell: pwsh
+        shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
           cmake -S . -B build -G "Visual Studio 17 2022" -A x64
@@ -65,14 +69,14 @@ jobs:
 
       - name: (win) Smoke test (loads onnxruntime-genai.dll)
         if: runner.os == 'Windows'
-        shell: pwsh
+        shell: powershell
         run: |
           & build\bin\Release\amdgpu-server.exe --help | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "amdgpu-server --help failed ($LASTEXITCODE)" }
 
       - name: (win) Package
         if: runner.os == 'Windows'
-        shell: pwsh
+        shell: powershell
         run: |
           tar -a -c -f "${{ matrix.asset }}" -C build\bin\Release .
           Write-Host ("${{ matrix.asset }} = {0:N1} MB" -f ((Get-Item "${{ matrix.asset }}").Length/1MB))
