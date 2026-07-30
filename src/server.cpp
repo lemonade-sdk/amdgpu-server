@@ -221,7 +221,13 @@ void RyzenAIServer::setupRoutes() {
     http_server_->Post("/v1/responses", [this](const httplib::Request& req, httplib::Response& res) {
         handleResponses(req, res);
     });
-    
+
+    // Chat session reset endpoint: drops the multi-turn KV cache so the next
+    // conversation starts fresh (Lemonade forwards /api/v1/chat/sessions/reset here).
+    http_server_->Post("/v1/sessions/reset", [this](const httplib::Request& req, httplib::Response& res) {
+        handleSessionReset(req, res);
+    });
+
     // Root redirect
     http_server_->Get("/", [this](const httplib::Request&, httplib::Response& res) {
         json response = {
@@ -259,8 +265,20 @@ void RyzenAIServer::handleHealth(const httplib::Request& req, httplib::Response&
         {"max_prompt_length", inference_engine_->getMaxPromptLength()},
         {"ryzenai_version", inference_engine_->getRyzenAIVersion()}
     };
-    
+
     res.set_content(response.dump(2), "application/json");
+}
+
+void RyzenAIServer::handleSessionReset(const httplib::Request& req, httplib::Response& res) {
+    (void)req;
+    try {
+        inference_engine_->resetChatSession();
+        json response = {{"status", "success"}, {"message", "chat session reset"}};
+        res.set_content(response.dump(), "application/json");
+    } catch (const std::exception& e) {
+        res.status = 500;
+        res.set_content(createErrorResponse(e.what(), "internal_error").dump(), "application/json");
+    }
 }
 
 void RyzenAIServer::handleCompletions(const httplib::Request& req, httplib::Response& res) {

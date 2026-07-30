@@ -460,12 +460,93 @@ std::vector<int32_t> InferenceEngine::truncatePrompt(const std::vector<int32_t>&
               << std::endl;
     
     return std::vector<int32_t>(
-        input_ids.begin() + truncate_amount, 
+        input_ids.begin() + truncate_amount,
         input_ids.end()
     );
 }
 
-std::string InferenceEngine::complete(const std::string& prompt, const GenerationParams& params, CompletionTimingData* out_timing) {
+void InferenceEngine::resetChatSession() {
+    std::lock_guard<std::mutex> lock(inference_mutex_);
+    chat_generator_.reset();
+    chat_cached_tokens_.clear();
+    chat_params_valid_ = false;
+    std::cout << "[InferenceEngine] Chat KV cache reset" << std::endl;
+}
+
+OgaGenerator* InferenceEngine::prepareTextGenerator(const std::vector<int32_t>& input_ids,
+                                                    const GenerationParams& params, bool reuse_kv,
+                                                    std::unique_ptr<OgaGenerator>& owned) {
+    auto set_options = [&](OgaGeneratorParams& gp, int max_length) {
+        gp.SetSearchOption("max_length", max_length);
+        gp.SetSearchOption("temperature", params.temperature);
+        gp.SetSearchOption("top_p", params.top_p);
+        gp.SetSearchOption("top_k", static_cast<double>(params.top_k));
+        gp.SetSearchOption("repetition_penalty", params.repetition_penalty);
+        gp.SetSearchOptionBool("do_sample", params.do_sample);
+        // Lock random_seed for deterministic behavior (matching Python reference).
+        gp.SetSearchOption("random_seed", 1.0);
+    };
+
+    if (!reuse_kv) {
+        // Stateless: fresh generator sized to prompt + new tokens.
+        int total_max_length = static_cast<int>(input_ids.size()) + params.max_length;
+        if (model_context_length_ > 0 && total_max_length > model_context_length_) {
+            total_max_length = model_context_length_;
+        }
+        auto gp = OgaGeneratorParams::Create(*model_);
+        set_options(*gp, total_max_length);
+        owned = OgaGenerator::Create(*model_, *gp);
+        owned->AppendTokens(input_ids.data(), input_ids.size());
+        return owned.get();
+    }
+
+    // Multi-turn: a persistent generator sized to the context window. Sampling
+    // params are baked into the generator, so recreate (dropping KV) when they
+    // change between turns.
+    bool params_changed = !chat_params_valid_ ||
+        chat_temperature_ != params.temperature ||
+        chat_top_p_ != params.top_p ||
+        chat_top_k_ != params.top_k ||
+        chat_repetition_penalty_ != params.repetition_penalty ||
+        chat_do_sample_ != params.do_sample;
+
+    if (!chat_generator_ || params_changed) {
+        int ctx = (model_context_length_ > 0) ? model_context_length_ : max_prompt_length_;
+        int need = static_cast<int>(input_ids.size()) + params.max_length;
+        if (ctx < need) ctx = need;
+        auto gp = OgaGeneratorParams::Create(*model_);
+        set_options(*gp, ctx);
+        chat_generator_ = OgaGenerator::Create(*model_, *gp);
+        chat_cached_tokens_.clear();
+        chat_params_valid_ = true;
+        chat_temperature_ = params.temperature;
+        chat_top_p_ = params.top_p;
+        chat_top_k_ = params.top_k;
+        chat_repetition_penalty_ = params.repetition_penalty;
+        chat_do_sample_ = params.do_sample;
+    }
+
+    // Longest common prefix between the cached sequence and the new prompt.
+    size_t common = 0;
+    while (common < chat_cached_tokens_.size() && common < input_ids.size() &&
+           chat_cached_tokens_[common] == input_ids[common]) {
+        ++common;
+    }
+    // Discard KV beyond the shared prefix, then append only the new suffix.
+    if (chat_cached_tokens_.size() > common) {
+        chat_generator_->RewindTo(common);
+    }
+    if (input_ids.size() > common) {
+        chat_generator_->AppendTokens(input_ids.data() + common, input_ids.size() - common);
+    }
+    chat_cached_tokens_.assign(input_ids.begin(), input_ids.end());
+    std::cout << "[InferenceEngine] KV reuse: prompt=" << input_ids.size()
+              << " reused_prefix=" << common
+              << " appended=" << (input_ids.size() - common) << std::endl;
+    return chat_generator_.get();
+}
+
+std::string InferenceEngine::complete(const std::string& prompt, const GenerationParams& params, CompletionTimingData* out_timing, bool reuse_kv) {
     std::lock_guard<std::mutex> lock(inference_mutex_);
     
     try {
@@ -484,47 +565,34 @@ std::string InferenceEngine::complete(const std::string& prompt, const Generatio
         std::vector<int32_t> input_ids(input_ids_ptr, input_ids_ptr + input_ids_count);
         input_ids = truncatePrompt(input_ids);
         
-        // Create generator params
-        auto gen_params = OgaGeneratorParams::Create(*model_);
-        // max_length should be prompt_length + max_new_tokens
-        // params.max_length is max_new_tokens from the caller
-        int total_max_length = static_cast<int>(input_ids.size()) + params.max_length;
-        if (model_context_length_ > 0 && total_max_length > model_context_length_) {
-            total_max_length = model_context_length_;
-        }
-        gen_params->SetSearchOption("max_length", total_max_length);
-        gen_params->SetSearchOption("temperature", params.temperature);
-        gen_params->SetSearchOption("top_p", params.top_p);
-        gen_params->SetSearchOption("top_k", static_cast<double>(params.top_k));
-        gen_params->SetSearchOption("repetition_penalty", params.repetition_penalty);
-        gen_params->SetSearchOptionBool("do_sample", params.do_sample);
-        // Lock random_seed to 1 for deterministic behavior (matching Python reference)
-        gen_params->SetSearchOption("random_seed", 1.0);
-        
-        // Generate
-        auto generator = OgaGenerator::Create(*model_, *gen_params);
-        
-        // Set input tokens
-        generator->AppendTokens(input_ids.data(), input_ids.size());
-        
+        // Prepare the generator (persistent + KV reuse when reuse_kv is set).
+        std::unique_ptr<OgaGenerator> owned;
+        OgaGenerator* generator = prepareTextGenerator(input_ids, params, reuse_kv, owned);
+
         std::cout << "[InferenceEngine] Generating tokens..." << std::endl;
-        
-        while (!generator->IsDone()) {
+
+        int new_generated = 0;
+        while (!generator->IsDone() && new_generated < params.max_length) {
             generator->GenerateNextToken();
-            
+            ++new_generated;
+
             // Track time to first token
             if (!first_token_received) {
                 first_token_time = std::chrono::high_resolution_clock::now();
                 first_token_received = true;
             }
         }
-        
+
         // End timing
         auto end_time = std::chrono::high_resolution_clock::now();
-        
+
         // Get the output
         const int32_t* output_ptr = generator->GetSequenceData(0);
         size_t output_count = generator->GetSequenceCount(0);
+        // Keep the persistent cache in sync (full prompt + freshly generated tokens).
+        if (reuse_kv) {
+            chat_cached_tokens_.assign(output_ptr, output_ptr + output_count);
+        }
         
         // Calculate actual generated token count
         int generated_token_count = (output_count > input_ids.size()) 
@@ -585,58 +653,41 @@ std::string InferenceEngine::complete(const std::string& prompt, const Generatio
     }
 }
 
-void InferenceEngine::streamComplete(const std::string& prompt, 
+void InferenceEngine::streamComplete(const std::string& prompt,
                                      const GenerationParams& params,
-                                     StreamCallback callback) {
+                                     StreamCallback callback,
+                                     bool reuse_kv) {
     std::lock_guard<std::mutex> lock(inference_mutex_);
-    
+
     try {
         // Tokenize input
         auto sequences = OgaSequences::Create();
         tokenizer_->Encode(prompt.c_str(), *sequences);
-        
+
         // Get token IDs and apply truncation
         const int32_t* input_ids_ptr = sequences->SequenceData(0);
         size_t input_ids_count = sequences->SequenceCount(0);
         std::vector<int32_t> input_ids(input_ids_ptr, input_ids_ptr + input_ids_count);
         input_ids = truncatePrompt(input_ids);
-        
-        // Create generator params
-        auto gen_params = OgaGeneratorParams::Create(*model_);
-        // max_length should be prompt_length + max_new_tokens
-        // params.max_length is max_new_tokens from the caller
-        int total_max_length = static_cast<int>(input_ids.size()) + params.max_length;
-        if (model_context_length_ > 0 && total_max_length > model_context_length_) {
-            total_max_length = model_context_length_;
-        }
+
+        // Prepare the generator (persistent + KV reuse when reuse_kv is set).
+        std::unique_ptr<OgaGenerator> owned;
+        OgaGenerator* generator = prepareTextGenerator(input_ids, params, reuse_kv, owned);
         std::cout << "[InferenceEngine::streamComplete] prompt_length=" << input_ids.size()
                   << ", max_new_tokens=" << params.max_length
-                  << ", total_max_length=" << total_max_length << std::endl;
-        gen_params->SetSearchOption("max_length", total_max_length);
-        gen_params->SetSearchOption("temperature", params.temperature);
-        gen_params->SetSearchOption("top_p", params.top_p);
-        gen_params->SetSearchOption("top_k", static_cast<double>(params.top_k));
-        gen_params->SetSearchOption("repetition_penalty", params.repetition_penalty);
-        gen_params->SetSearchOptionBool("do_sample", params.do_sample);
-        // Lock random_seed to 1 for deterministic behavior (matching Python reference)
-        gen_params->SetSearchOption("random_seed", 1.0);
-        
-        // Generate
-        auto generator = OgaGenerator::Create(*model_, *gen_params);
-        
-        // Set input tokens
-        generator->AppendTokens(input_ids.data(), input_ids.size());
-        
+                  << ", reuse_kv=" << reuse_kv << std::endl;
+
         std::cout << "[InferenceEngine] Generating tokens (streaming)..." << std::endl;
-        
+
         // Use OgaTokenizerStream for efficient incremental token decoding
         auto tokenizer_stream = OgaTokenizerStream::Create(*tokenizer_);
-        
+
         size_t token_count = 0;
         std::string accumulated_output;  // Track full output for stop sequence detection
         bool client_disconnected = false;  // Track if client disconnected
-        
-        while (!generator->IsDone() && !client_disconnected) {
+
+        while (!generator->IsDone() && !client_disconnected &&
+               static_cast<int>(token_count) < params.max_length) {
             generator->GenerateNextToken();
             
             // Get just the new token
@@ -678,9 +729,17 @@ void InferenceEngine::streamComplete(const std::string& prompt,
             
             token_count++;
         }
-        
+
+        // Keep the persistent cache in sync (full prompt + freshly generated tokens),
+        // so the next turn can reuse this turn's KV.
+        if (reuse_kv) {
+            const int32_t* seq = generator->GetSequenceData(0);
+            size_t seq_len = generator->GetSequenceCount(0);
+            chat_cached_tokens_.assign(seq, seq + seq_len);
+        }
+
         if (client_disconnected) {
-            std::cout << "[InferenceEngine] Generation stopped early due to client disconnect (generated " 
+            std::cout << "[InferenceEngine] Generation stopped early due to client disconnect (generated "
                       << token_count << " tokens)" << std::endl;
         }
         

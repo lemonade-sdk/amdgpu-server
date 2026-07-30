@@ -33,12 +33,21 @@ public:
     
     // Synchronous completion
     // Returns generated text. If out_timing is provided, stores timing data.
-    std::string complete(const std::string& prompt, const GenerationParams& params, CompletionTimingData* out_timing = nullptr);
-    
+    // reuse_kv: reuse the KV cache across calls via a persistent generator with
+    // longest-common-prefix reuse. Correct for any request sequence (unrelated
+    // prompts rewind to their divergence point), so it defaults on; call
+    // resetChatSession() to start a fresh conversation.
+    std::string complete(const std::string& prompt, const GenerationParams& params,
+                         CompletionTimingData* out_timing = nullptr, bool reuse_kv = true);
+
     // Streaming completion
-    void streamComplete(const std::string& prompt, 
+    void streamComplete(const std::string& prompt,
                        const GenerationParams& params,
-                       StreamCallback callback);
+                       StreamCallback callback,
+                       bool reuse_kv = true);
+
+    // Drop the persistent multi-turn KV cache (start a fresh conversation).
+    void resetChatSession();
     
     // Apply chat template to messages
     std::string applyChatTemplate(const std::string& messages_json, const std::string& tools_json = "");
@@ -85,11 +94,30 @@ private:
     std::string resolveModelPath(const std::string& path);
     std::vector<int32_t> truncatePrompt(const std::vector<int32_t>& input_ids);
     bool validateModelDirectory(const std::string& path);
-    
+
+    // Prepare the generator for a text-completion pass. For reuse_kv, uses the
+    // persistent chat generator (rewind to the longest common prefix, then append
+    // only the new tokens); otherwise builds a fresh generator held in `owned`.
+    // Returns the generator to drive.
+    OgaGenerator* prepareTextGenerator(const std::vector<int32_t>& input_ids,
+                                       const GenerationParams& params, bool reuse_kv,
+                                       std::unique_ptr<OgaGenerator>& owned);
+
     std::unique_ptr<OgaModel> model_;
     std::unique_ptr<OgaTokenizer> tokenizer_;
     std::unique_ptr<OgaMultiModalProcessor> processor_;  // only for multimodal models
     bool is_multimodal_ = false;
+
+    // Persistent multi-turn chat generator + the token sequence currently in its
+    // KV cache. Reused across chat turns; recreated when sampling params change.
+    std::unique_ptr<OgaGenerator> chat_generator_;
+    std::vector<int32_t> chat_cached_tokens_;
+    bool chat_params_valid_ = false;
+    float chat_temperature_ = 0.0f;
+    float chat_top_p_ = 0.0f;
+    int chat_top_k_ = 0;
+    float chat_repetition_penalty_ = 0.0f;
+    bool chat_do_sample_ = false;
 
     std::string model_path_;
     std::string model_name_;
