@@ -43,6 +43,7 @@ struct CompletionRequest {
 // Chat completion request (OpenAI format)
 struct ChatCompletionRequest {
     std::vector<ChatMessage> messages;
+    std::string conversation_id;  // reserved: parsed but not required; server uses default session
     int max_tokens = 1500;
     float temperature = 0.7f;
     float top_p = 0.9f;

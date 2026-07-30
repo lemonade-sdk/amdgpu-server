@@ -91,6 +91,70 @@ std::vector<std::string> extract_request_images(const json& request_json) {
     return images;
 }
 
+// Only images attached to the latest user turn. Follow-up text turns must not
+// re-ingest images from earlier history (that forced full prompt reprocessing).
+std::vector<std::string> extract_images_from_last_user_message(const json& request_json) {
+    std::vector<std::string> images;
+    if (!request_json.contains("messages") || !request_json["messages"].is_array()) {
+        return images;
+    }
+
+    const json* last_user = nullptr;
+    for (const auto& msg : request_json["messages"]) {
+        if (msg.value("role", "") == "user") {
+            last_user = &msg;
+        }
+    }
+    if (last_user == nullptr || !last_user->contains("content") || !(*last_user)["content"].is_array()) {
+        return images;
+    }
+
+    for (const auto& item : (*last_user)["content"]) {
+        if (!item.is_object()) continue;
+        std::string url;
+        if (item.contains("image_url")) {
+            const auto& iu = item["image_url"];
+            if (iu.is_object() && iu.contains("url") && iu["url"].is_string()) {
+                url = iu["url"].get<std::string>();
+            } else if (iu.is_string()) {
+                url = iu.get<std::string>();
+            }
+        } else if (item.value("type", "") == "image" && item.contains("url") && item["url"].is_string()) {
+            url = item["url"].get<std::string>();
+        }
+        if (url.empty()) continue;
+        std::string bytes = resolve_image_bytes(url);
+        if (!bytes.empty()) {
+            images.push_back(std::move(bytes));
+        } else {
+            std::cerr << "[WARNING] Could not resolve image reference in latest user turn (skipped)"
+                      << std::endl;
+        }
+    }
+    return images;
+}
+
+void logOpenAIChatRequestSummary(const ChatCompletionRequest& chat_req, bool multimodal) {
+    std::ostringstream role_seq;
+    for (size_t i = 0; i < chat_req.messages.size(); ++i) {
+        if (i > 0) {
+            role_seq << " -> ";
+        }
+        role_seq << chat_req.messages[i].role;
+        if (chat_req.messages[i].content.find("<tool_response>") != std::string::npos) {
+            role_seq << "(tool_response)";
+        }
+    }
+
+    const size_t tool_count = chat_req.tools.is_array() ? chat_req.tools.size() : 0;
+    std::cout << "[Server][ChatDebug] client=openai-compat multimodal=" << (multimodal ? 1 : 0)
+              << " messages=" << chat_req.messages.size()
+              << " tools=" << tool_count
+              << " stream=" << chat_req.stream
+              << " session=" << kDefaultConversationId
+              << " roles=" << role_seq.str() << std::endl;
+}
+
 }  // namespace
 
 RyzenAIServer::RyzenAIServer(const CommandLineArgs& args) 
@@ -221,6 +285,10 @@ void RyzenAIServer::setupRoutes() {
     http_server_->Post("/v1/responses", [this](const httplib::Request& req, httplib::Response& res) {
         handleResponses(req, res);
     });
+
+    http_server_->Post("/v1/sessions/reset", [this](const httplib::Request& req, httplib::Response& res) {
+        handleSessionReset(req, res);
+    });
     
     // Root redirect
     http_server_->Get("/", [this](const httplib::Request&, httplib::Response& res) {
@@ -232,7 +300,8 @@ void RyzenAIServer::setupRoutes() {
                 "/health",
                 "/v1/completions",
                 "/v1/chat/completions",
-                "/v1/responses"
+                "/v1/responses",
+                "/v1/sessions/reset"
             }}
         };
         res.set_content(response.dump(2), "application/json");
@@ -261,6 +330,32 @@ void RyzenAIServer::handleHealth(const httplib::Request& req, httplib::Response&
     };
     
     res.set_content(response.dump(2), "application/json");
+}
+
+void RyzenAIServer::handleSessionReset(const httplib::Request& req, httplib::Response& res) {
+    try {
+        std::string conversation_id = kDefaultConversationId;
+        if (!req.body.empty()) {
+            json request_json = json::parse(req.body);
+            if (request_json.contains("conversation_id") &&
+                request_json["conversation_id"].is_string()) {
+                conversation_id = request_json["conversation_id"].get<std::string>();
+            }
+        }
+
+        inference_engine_->resetMultiTurnSession(conversation_id);
+
+        json response = {
+            {"status", "success"},
+            {"conversation_id", conversation_id},
+            {"message", "Chat session KV cache reset"}
+        };
+        res.set_content(response.dump(), "application/json");
+    } catch (const std::exception& e) {
+        res.status = 500;
+        res.set_content(createErrorResponse(e.what(), "session_reset_error").dump(),
+                        "application/json");
+    }
 }
 
 void RyzenAIServer::handleCompletions(const httplib::Request& req, httplib::Response& res) {
@@ -614,14 +709,16 @@ void RyzenAIServer::handleChatCompletions(const httplib::Request& req, httplib::
             return;
         }
 
-        // Multimodal branch: a VLM request carrying images is handled separately
-        // (OpenAI image_url content -> OGA vision pipeline). Returns early.
+        logOpenAIChatRequestSummary(chat_req, inference_engine_->isMultimodal());
+
+        // VLM models always use the multimodal multi-turn path (KV cache reuse on
+        // text-only follow-ups). Only images in the latest user turn are processed.
         if (inference_engine_->isMultimodal()) {
-            std::vector<std::string> images = extract_request_images(request_json);
-            if (!images.empty()) {
-                handleMultimodalChat(request_json, chat_req, images, res);
-                return;
-            }
+            json messages_array = request_json.contains("messages") ? request_json["messages"] : json::array();
+            std::vector<std::string> new_turn_images = extract_images_from_last_user_message(request_json);
+            std::vector<std::string> all_images = extract_request_images(request_json);
+            handleMultimodalChat(request_json, chat_req, messages_array, new_turn_images, all_images, res);
+            return;
         }
 
         // Convert messages to JSON array for chat template. Use the raw request
@@ -643,6 +740,10 @@ void RyzenAIServer::handleChatCompletions(const httplib::Request& req, httplib::
         std::string prompt = inference_engine_->applyChatTemplate(messages_array.dump(), tools_json);
         std::cout << "[Server DEBUG] Generated prompt length: " << prompt.length() << " chars" << std::endl;
         std::cout << "[Server DEBUG] Prompt (first 500 chars): " << prompt.substr(0, std::min(size_t(500), prompt.length())) << std::endl;
+
+        // Text chat always uses the single default multi-turn AppendTokens session.
+        const bool use_multi_turn = true;
+        const std::string session_id = kDefaultConversationId;
         
         if (chat_req.stream) {
             // REAL-TIME STREAMING: Send chunks as tokens are generated
@@ -662,9 +763,12 @@ void RyzenAIServer::handleChatCompletions(const httplib::Request& req, httplib::
             // Count prompt tokens before streaming
             int prompt_tokens = inference_engine_->countTokens(prompt);
             
+            std::string messages_json = messages_array.dump();
+
             res.set_chunked_content_provider(
                 "text/event-stream",
-                [this, prompt, params, model_id, has_tools, prompt_tokens](size_t offset, httplib::DataSink& sink) {
+                [this, prompt, params, model_id, has_tools, prompt_tokens, use_multi_turn,
+                 session_id, messages_json](size_t offset, httplib::DataSink& sink) {
                     if (offset > 0) return false; // Only run once
                     
                     try {
@@ -680,8 +784,7 @@ void RyzenAIServer::handleChatCompletions(const httplib::Request& req, httplib::
                         // Create reasoning parser for streaming
                         ReasoningStreamParser reasoning_parser;
                         
-                        // Generate and send tokens in real-time
-                        inference_engine_->streamComplete(prompt, params, 
+                        StreamCallback stream_callback =
                             [&sink, model_id, &token_count, &full_response, &reasoning_parser, &first_token_received, &first_token_time](const std::string& token, bool is_final) -> bool {
                                 // Track time to first token
                                 if (!first_token_received && !token.empty()) {
@@ -793,8 +896,13 @@ void RyzenAIServer::handleChatCompletions(const httplib::Request& req, httplib::
                                 
                                 token_count++;
                                 return true; // Continue generation
-                            }
-                        );
+                            };
+
+                        if (use_multi_turn) {
+                            inference_engine_->streamMultiTurn(session_id, messages_json, params, stream_callback);
+                        } else {
+                            inference_engine_->streamComplete(prompt, params, stream_callback);
+                        }
                         
                         // After generation completes, do a final flush to catch any remaining buffered content
                         // This handles the case where the last few tokens didn't trigger processing due to buffer size
@@ -938,7 +1046,16 @@ void RyzenAIServer::handleChatCompletions(const httplib::Request& req, httplib::
             );
             
             CompletionTimingData timing;
-            std::string output = inference_engine_->complete(prompt, params, &timing);
+            std::string output;
+            if (use_multi_turn) {
+                output = inference_engine_->completeMultiTurn(
+                    session_id,
+                    messages_array.dump(),
+                    params,
+                    &timing);
+            } else {
+                output = inference_engine_->complete(prompt, params, &timing);
+            }
             
             // Parse reasoning content from output
             auto reasoning_result = parseReasoningContent(output);
@@ -1029,18 +1146,17 @@ void RyzenAIServer::handleChatCompletions(const httplib::Request& req, httplib::
 
 void RyzenAIServer::handleMultimodalChat(const json& request_json,
                                          const ChatCompletionRequest& chat_req,
-                                         const std::vector<std::string>& images,
+                                         const json& messages_array,
+                                         const std::vector<std::string>& new_turn_images,
+                                         const std::vector<std::string>& all_images,
                                          httplib::Response& res) {
-    // Build the prompt strictly via the OGA jinja template so image placeholders
-    // (<|vision_start|><|image_pad|><|vision_end|>) are emitted for each image.
-    json messages_array = request_json.contains("messages") ? request_json["messages"] : json::array();
     std::string tools_json = chat_req.tools.empty() ? "" : chat_req.tools.dump();
-    std::string prompt = inference_engine_->applyChatTemplateRaw(messages_array.dump(), tools_json);
+    const std::string session_id = kDefaultConversationId;
+    const std::string messages_json = messages_array.dump();
 
-    std::cout << "[Server] Multimodal chat request (images=" << images.size()
-              << ", stream=" << chat_req.stream << ")" << std::endl;
-    std::cout << "[Server DEBUG] MM prompt (first 300): "
-              << prompt.substr(0, std::min(size_t(300), prompt.length())) << std::endl;
+    std::cout << "[Server] Multimodal chat request (new_turn_images=" << new_turn_images.size()
+              << ", all_images=" << all_images.size()
+              << ", stream=" << chat_req.stream << ", multi_turn=1)" << std::endl;
 
     GenerationParams params = createGenerationParams(
         chat_req.max_tokens, chat_req.temperature, chat_req.top_p,
@@ -1070,15 +1186,18 @@ void RyzenAIServer::handleMultimodalChat(const json& request_json,
         res.set_header("Connection", "keep-alive");
         res.set_header("X-Accel-Buffering", "no");
 
-        int prompt_tokens = inference_engine_->countTokens(prompt);
+        std::string preview_prompt = inference_engine_->applyChatTemplateRaw(messages_json, tools_json);
+        int prompt_tokens = inference_engine_->countTokens(preview_prompt);
 
         res.set_chunked_content_provider(
             "text/event-stream",
-            [this, prompt, images, params, model_id, prompt_tokens, escapeJson](size_t offset, httplib::DataSink& sink) {
+            [this, messages_json, new_turn_images, all_images, tools_json, params, model_id, prompt_tokens, session_id, escapeJson](
+                size_t offset, httplib::DataSink& sink) {
                 if (offset > 0) return false;
                 try {
                     int token_count = 0;
-                    inference_engine_->streamCompleteMultimodal(prompt, images, params,
+                    inference_engine_->streamMultiTurnMultimodal(
+                        session_id, messages_json, new_turn_images, all_images, tools_json, params,
                         [&sink, model_id, &token_count, &escapeJson](const std::string& token, bool /*is_final*/) -> bool {
                             std::string chunk =
                                 "data: {\"id\":\"chatcmpl-" + std::to_string(std::time(nullptr)) +
@@ -1102,9 +1221,10 @@ void RyzenAIServer::handleMultimodalChat(const json& request_json,
                     const char* done = "data: [DONE]\n\n";
                     sink.write(done, strlen(done));
                     sink.done();
-                    std::cout << "[Server] [OK] Streamed " << token_count << " multimodal tokens" << std::endl;
+                    std::cout << "[Server] [OK] Streamed " << token_count << " multimodal multi-turn tokens"
+                              << std::endl;
                 } catch (const std::exception& e) {
-                    std::cerr << "[ERROR] Multimodal streaming failed: " << e.what() << std::endl;
+                    std::cerr << "[ERROR] Multimodal multi-turn streaming failed: " << e.what() << std::endl;
                     json err = createErrorResponse(e.what(), "inference_error");
                     std::string es = "data: " + err.dump() + "\n\n";
                     sink.write(es.c_str(), es.size());
@@ -1115,10 +1235,11 @@ void RyzenAIServer::handleMultimodalChat(const json& request_json,
         return;
     }
 
-    // Non-streaming
     CompletionTimingData timing;
-    int prompt_tokens = inference_engine_->countTokens(prompt);
-    std::string content = inference_engine_->completeMultimodal(prompt, images, params, &timing);
+    std::string preview_prompt = inference_engine_->applyChatTemplateRaw(messages_json, tools_json);
+    int prompt_tokens = inference_engine_->countTokens(preview_prompt);
+    std::string content = inference_engine_->completeMultiTurnMultimodal(
+        session_id, messages_json, new_turn_images, all_images, tools_json, params, &timing);
 
     json response = {
         {"id", "chatcmpl-" + std::to_string(std::time(nullptr))},
@@ -1155,6 +1276,7 @@ void RyzenAIServer::run() {
     std::cout << "  GET  http://" << args_.host << ":" << args_.port << "/health\n";
     std::cout << "  POST http://" << args_.host << ":" << args_.port << "/v1/completions\n";
     std::cout << "  POST http://" << args_.host << ":" << args_.port << "/v1/chat/completions\n";
+    std::cout << "  POST http://" << args_.host << ":" << args_.port << "/v1/sessions/reset\n";
     std::cout << "\n";
     std::cout << "Press Ctrl+C to stop the server\n";
     std::cout << "===============================================================\n\n";
