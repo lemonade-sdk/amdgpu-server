@@ -38,9 +38,11 @@ to fold decoded images into the prompt.
 - **AMD GPU, gfx1151 (Strix Halo)**, with the AMD graphics driver installed
   (provides `amdhip64_7.dll`)
 - **Visual Studio 2022 or 2026**, **CMake 3.20+**
-- The **AMD GPU package** ("gpu-test-package") — ships `onnxruntime-genai.dll`,
-  the AMDGPU/hipep EP, and the ROCm runtime DLLs. Point `AMDGPU_PKG_ROOT` at the
-  extracted directory (it must contain `bin/onnxruntime-genai.dll`).
+- The **AMD GPU package** — from the [ROCm/hip-ep releases](https://github.com/ROCm/hip-ep/releases):
+  download `gpu-test-package-windows-<version>.zip`, extract it, and point
+  `AMDGPU_PKG_ROOT` at the extracted directory (it must contain
+  `bin/onnxruntime-genai.dll`). This package ships `onnxruntime-genai.dll`, the
+  AMDGPU/hipep EP, and the ROCm runtime DLLs.
 
 > The package ships the OGA DLL but **no import library and no OGA headers**, so
 > the build (a) synthesizes `onnxruntime-genai.lib` from the DLL's exports via
@@ -129,6 +131,20 @@ are managed as wrapped-server subprocesses:
 
 Lemonade forwards OpenAI-compatible requests to the subprocess and routes by model
 recipe. Both are `DEVICE_GPU` and can be loaded concurrently.
+
+## Releases
+
+`amdgpu-server.zip` releases (the artifact Lemonade downloads) are built by CI
+(`.github/workflows/build_and_release.yml`): a Windows runner downloads the
+`gpu-test-package-windows` asset from [ROCm/hip-ep](https://github.com/ROCm/hip-ep/releases)
+(pinned by `HIP_EP_VERSION`), builds `amdgpu-server.exe`, and bundles it with the
+EP / ROCm / OGA runtime DLLs. Pushing a `v*` tag publishes a GitHub release with
+`amdgpu-server.zip` attached. Lemonade resolves it via
+`lemonade-sdk/amdgpu-server` → `amdgpu-server.zip` at the version pinned in
+Lemonade's `backend_versions.json`.
+
+Note: CI builds on GitHub-hosted runners (no AMD GPU), so it validates
+compilation and packaging only; runtime is validated on gfx1151 hardware.
 
 ## License
 
