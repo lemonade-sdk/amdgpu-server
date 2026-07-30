@@ -19,7 +19,9 @@ env:
 jobs:
   build-and-release:
     name: Build amdgpu-server
-    runs-on: windows-latest
+    # windows-2022 provides the "Visual Studio 17 2022" generator; windows-latest
+    # has moved off it. Bump the runner + generator together when upgrading.
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
 
