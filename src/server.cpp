@@ -12,6 +12,33 @@ namespace ryzenai {
 
 namespace {
 
+std::string escapeJsonString(const std::string& s) {
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string escaped;
+    escaped.reserve(s.size() + 8);
+    for (unsigned char c : s) {
+        switch (c) {
+            case '\\': escaped += "\\\\"; break;
+            case '"':  escaped += "\\\""; break;
+            case '\b': escaped += "\\b";  break;
+            case '\f': escaped += "\\f";  break;
+            case '\n': escaped += "\\n";  break;
+            case '\r': escaped += "\\r";  break;
+            case '\t': escaped += "\\t";  break;
+            default:
+                if (c < 0x20) {
+                    escaped += "\\u00";
+                    escaped += hex[(c >> 4) & 0x0f];
+                    escaped += hex[c & 0x0f];
+                } else {
+                    escaped.push_back(static_cast<char>(c));
+                }
+                break;
+        }
+    }
+    return escaped;
+}
+
 // Minimal base64 decoder for image data URLs.
 std::string base64_decode(const std::string& input) {
     static const std::string chars =
@@ -425,30 +452,8 @@ void RyzenAIServer::handleCompletions(const httplib::Request& req, httplib::Resp
                                 // Process token through reasoning parser
                                 auto [reasoning_part, content_part] = reasoning_parser.processToken(token);
                                 
-                                // Helper function to escape JSON strings
                                 auto escapeJson = [](const std::string& str) -> std::string {
-                                    std::string escaped = str;
-                                    size_t pos = 0;
-                                    while ((pos = escaped.find('\\', pos)) != std::string::npos) {
-                                        escaped.replace(pos, 1, "\\\\");
-                                        pos += 2;
-                                    }
-                                    pos = 0;
-                                    while ((pos = escaped.find('"', pos)) != std::string::npos) {
-                                        escaped.replace(pos, 1, "\\\"");
-                                        pos += 2;
-                                    }
-                                    pos = 0;
-                                    while ((pos = escaped.find('\n', pos)) != std::string::npos) {
-                                        escaped.replace(pos, 1, "\\n");
-                                        pos += 2;
-                                    }
-                                    pos = 0;
-                                    while ((pos = escaped.find('\r', pos)) != std::string::npos) {
-                                        escaped.replace(pos, 1, "\\r");
-                                        pos += 2;
-                                    }
-                                    return escaped;
+                                    return escapeJsonString(str);
                                 };
                                 
                                 // Send reasoning content chunk if present
@@ -529,30 +534,8 @@ void RyzenAIServer::handleCompletions(const httplib::Request& req, httplib::Resp
                         // After generation completes, do a final flush to catch any remaining buffered content
                         auto [final_reasoning, final_content] = reasoning_parser.flush();
                         
-                        // Helper function to escape JSON strings
                         auto escapeJson = [](const std::string& str) -> std::string {
-                            std::string escaped = str;
-                            size_t pos = 0;
-                            while ((pos = escaped.find('\\', pos)) != std::string::npos) {
-                                escaped.replace(pos, 1, "\\\\");
-                                pos += 2;
-                            }
-                            pos = 0;
-                            while ((pos = escaped.find('"', pos)) != std::string::npos) {
-                                escaped.replace(pos, 1, "\\\"");
-                                pos += 2;
-                            }
-                            pos = 0;
-                            while ((pos = escaped.find('\n', pos)) != std::string::npos) {
-                                escaped.replace(pos, 1, "\\n");
-                                pos += 2;
-                            }
-                            pos = 0;
-                            while ((pos = escaped.find('\r', pos)) != std::string::npos) {
-                                escaped.replace(pos, 1, "\\r");
-                                pos += 2;
-                            }
-                            return escaped;
+                            return escapeJsonString(str);
                         };
                         
                         // Send any remaining reasoning content
@@ -798,30 +781,8 @@ void RyzenAIServer::handleChatCompletions(const httplib::Request& req, httplib::
                                 // Process token through reasoning parser
                                 auto [reasoning_part, content_part] = reasoning_parser.processToken(token);
                                 
-                                // Helper function to escape JSON strings
                                 auto escapeJson = [](const std::string& str) -> std::string {
-                                    std::string escaped = str;
-                                    size_t pos = 0;
-                                    while ((pos = escaped.find('\\', pos)) != std::string::npos) {
-                                        escaped.replace(pos, 1, "\\\\");
-                                        pos += 2;
-                                    }
-                                    pos = 0;
-                                    while ((pos = escaped.find('"', pos)) != std::string::npos) {
-                                        escaped.replace(pos, 1, "\\\"");
-                                        pos += 2;
-                                    }
-                                    pos = 0;
-                                    while ((pos = escaped.find('\n', pos)) != std::string::npos) {
-                                        escaped.replace(pos, 1, "\\n");
-                                        pos += 2;
-                                    }
-                                    pos = 0;
-                                    while ((pos = escaped.find('\r', pos)) != std::string::npos) {
-                                        escaped.replace(pos, 1, "\\r");
-                                        pos += 2;
-                                    }
-                                    return escaped;
+                                    return escapeJsonString(str);
                                 };
                                 
                                 // Send reasoning content chunk if present
@@ -908,30 +869,8 @@ void RyzenAIServer::handleChatCompletions(const httplib::Request& req, httplib::
                         // This handles the case where the last few tokens didn't trigger processing due to buffer size
                         auto [final_reasoning, final_content] = reasoning_parser.flush();
                         
-                        // Helper function to escape JSON strings (reused from above)
                         auto escapeJson = [](const std::string& str) -> std::string {
-                            std::string escaped = str;
-                            size_t pos = 0;
-                            while ((pos = escaped.find('\\', pos)) != std::string::npos) {
-                                escaped.replace(pos, 1, "\\\\");
-                                pos += 2;
-                            }
-                            pos = 0;
-                            while ((pos = escaped.find('"', pos)) != std::string::npos) {
-                                escaped.replace(pos, 1, "\\\"");
-                                pos += 2;
-                            }
-                            pos = 0;
-                            while ((pos = escaped.find('\n', pos)) != std::string::npos) {
-                                escaped.replace(pos, 1, "\\n");
-                                pos += 2;
-                            }
-                            pos = 0;
-                            while ((pos = escaped.find('\r', pos)) != std::string::npos) {
-                                escaped.replace(pos, 1, "\\r");
-                                pos += 2;
-                            }
-                            return escaped;
+                            return escapeJsonString(str);
                         };
                         
                         // Send any remaining reasoning content
@@ -972,17 +911,7 @@ void RyzenAIServer::handleChatCompletions(const httplib::Request& req, httplib::
                                 for (const auto& tool_call : extracted_tool_calls) {
                                     // Escape arguments for JSON
                                     std::string tool_call_args = tool_call.arguments.dump();
-                                    std::string escaped_args = tool_call_args;
-                                    size_t pos = 0;
-                                    while ((pos = escaped_args.find('\\', pos)) != std::string::npos) {
-                                        escaped_args.replace(pos, 1, "\\\\");
-                                        pos += 2;
-                                    }
-                                    pos = 0;
-                                    while ((pos = escaped_args.find('"', pos)) != std::string::npos) {
-                                        escaped_args.replace(pos, 1, "\\\"");
-                                        pos += 2;
-                                    }
+                                    std::string escaped_args = escapeJsonString(tool_call_args);
                                     
                                     std::string tool_call_chunk = 
                                         "data: {\"id\":\"chatcmpl-" + std::to_string(std::time(nullptr)) + 
@@ -1163,19 +1092,7 @@ void RyzenAIServer::handleMultimodalChat(const json& request_json,
         chat_req.top_k, chat_req.repeat_penalty, chat_req.stop);
 
     auto escapeJson = [](const std::string& str) -> std::string {
-        std::string e;
-        e.reserve(str.size() + 8);
-        for (char c : str) {
-            switch (c) {
-                case '\\': e += "\\\\"; break;
-                case '"':  e += "\\\""; break;
-                case '\n': e += "\\n";  break;
-                case '\r': e += "\\r";  break;
-                case '\t': e += "\\t";  break;
-                default:   e += c;       break;
-            }
-        }
-        return e;
+        return escapeJsonString(str);
     };
 
     const std::string model_id = model_id_;
@@ -1357,28 +1274,7 @@ void RyzenAIServer::handleResponses(const httplib::Request& req, httplib::Respon
                         // Generate and send tokens in real-time
                         inference_engine_->streamComplete(prompt, params, 
                             [&sink, &full_response](const std::string& token, bool is_final) -> bool {
-                                // Escape special characters for JSON
-                                std::string escaped_token = token;
-                                size_t pos = 0;
-                                while ((pos = escaped_token.find('\\', pos)) != std::string::npos) {
-                                    escaped_token.replace(pos, 1, "\\\\");
-                                    pos += 2;
-                                }
-                                pos = 0;
-                                while ((pos = escaped_token.find('"', pos)) != std::string::npos) {
-                                    escaped_token.replace(pos, 1, "\\\"");
-                                    pos += 2;
-                                }
-                                pos = 0;
-                                while ((pos = escaped_token.find('\n', pos)) != std::string::npos) {
-                                    escaped_token.replace(pos, 1, "\\n");
-                                    pos += 2;
-                                }
-                                pos = 0;
-                                while ((pos = escaped_token.find('\r', pos)) != std::string::npos) {
-                                    escaped_token.replace(pos, 1, "\\r");
-                                    pos += 2;
-                                }
+                                std::string escaped_token = escapeJsonString(token);
                                 
                                 // Accumulate unescaped token for final response
                                 full_response += token;
@@ -1399,28 +1295,7 @@ void RyzenAIServer::handleResponses(const httplib::Request& req, httplib::Respon
                         
                         std::cout << "[Server] Token generation completed, sending final events" << std::endl;
                         
-                        // Escape full_response for JSON
-                        std::string escaped_full_response = full_response;
-                        size_t pos = 0;
-                        while ((pos = escaped_full_response.find('\\', pos)) != std::string::npos) {
-                            escaped_full_response.replace(pos, 1, "\\\\");
-                            pos += 2;
-                        }
-                        pos = 0;
-                        while ((pos = escaped_full_response.find('"', pos)) != std::string::npos) {
-                            escaped_full_response.replace(pos, 1, "\\\"");
-                            pos += 2;
-                        }
-                        pos = 0;
-                        while ((pos = escaped_full_response.find('\n', pos)) != std::string::npos) {
-                            escaped_full_response.replace(pos, 1, "\\n");
-                            pos += 2;
-                        }
-                        pos = 0;
-                        while ((pos = escaped_full_response.find('\r', pos)) != std::string::npos) {
-                            escaped_full_response.replace(pos, 1, "\\r");
-                            pos += 2;
-                        }
+                        std::string escaped_full_response = escapeJsonString(full_response);
                         
                         // Send response.completed event
                         std::string completed_time = std::to_string(std::time(nullptr));
