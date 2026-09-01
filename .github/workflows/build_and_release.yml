@@ -16,6 +16,27 @@ env:
   HIP_EP_VERSION: v0.2.0
 
 jobs:
+  # tool_calls.cpp has no OGA dependency, so the shared tool-call suite runs on a
+  # plain hosted runner. This keeps the parsing logic covered even when the
+  # GPU-package build jobs are unavailable.
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch nlohmann/json
+        run: |
+          set -euo pipefail
+          mkdir -p external/json
+          curl -fsSL -o external/json/json.hpp             https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp
+
+      - name: Build and run tool-call tests
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -Wall -Wextra -Iinclude -Iexternal/json             test/test_tool_calls.cpp src/tool_calls.cpp -o test_tool_calls
+          ./test_tool_calls
+
   build:
     name: Build (${{ matrix.os }})
     strategy:
@@ -67,6 +88,13 @@ jobs:
           cmake --build build --config Release
           if (-not (Test-Path build\bin\Release\amdgpu-server.exe)) { throw "amdgpu-server.exe missing" }
 
+      - name: (win) Unit tests
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          ctest --test-dir build -C Release --output-on-failure
+
       - name: (win) Smoke test (loads onnxruntime-genai.dll)
         if: runner.os == 'Windows'
         shell: powershell
@@ -97,7 +125,30 @@ jobs:
           so=$(find pkg -name libonnxruntime-genai.so | head -1)
           test -n "$so" || { echo "libonnxruntime-genai.so not found"; exit 1; }
           root=$(dirname "$(dirname "$so")")   # parent of lib/
+          # Must be absolute: CMake POST_BUILD commands run from the build dir,
+          # so a relative root would resolve to build/pkg. The Windows step
+          # already exports an absolute path.
+          root=$(cd "$root" && pwd)
           echo "AMDGPU_PKG_ROOT=$root" >> "$GITHUB_ENV"
+
+      - name: (linux) Ensure cmake is available
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v cmake >/dev/null; then
+            cmake --version | head -1
+            exit 0
+          fi
+          # The self-hosted runner image has no cmake. Fetch a pinned portable
+          # build into the job temp dir rather than mutating the shared image.
+          ver=3.31.6
+          url="https://github.com/Kitware/CMake/releases/download/v${ver}/cmake-${ver}-linux-x86_64.tar.gz"
+          echo "cmake not found on PATH; downloading $url"
+          mkdir -p "$RUNNER_TEMP/cmake"
+          curl -fsSL "$url" | tar -xz --strip-components=1 -C "$RUNNER_TEMP/cmake"
+          echo "$RUNNER_TEMP/cmake/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/cmake/bin/cmake" --version | head -1
 
       - name: (linux) Configure & build
         if: runner.os == 'Linux'
@@ -107,6 +158,13 @@ jobs:
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j"$(nproc)"
           test -f build/bin/amdgpu-server
+
+      - name: (linux) Unit tests
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ctest --test-dir build --output-on-failure
 
       - name: (linux) Smoke test (loads libonnxruntime-genai.so)
         if: runner.os == 'Linux'
