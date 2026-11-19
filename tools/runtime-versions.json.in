@@ -1,0 +1,15 @@
+{
+  "amdgpu_server": "@PROJECT_VERSION@",
+  "hip_ep": "@HIP_EP_VERSION@",
+  "onnxruntime": "@ORT_VERSION@",
+  "onnxruntime_genai": "@OGA_VERSION@",
+  "onnxruntime_genai_pr_patches": ["@OGA_RUNTIME_PATCH@"],
+  "oga_headers": {
+    "version": "@OGA_HEADER_VERSION@",
+    "source": "@OGA_HEADER_SOURCE@",
+    "runtime_compatibility": "unverified",
+    "ort_genai_h_sha256": "@OGA_CXX_HEADER_SHA256@",
+    "ort_genai_c_h_sha256": "@OGA_C_HEADER_SHA256@"
+  },
+  "runtime_release": "https://github.com/ROCm/hip-ep/releases/tag/v@HIP_EP_VERSION@"
+}

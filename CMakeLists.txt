@@ -6,7 +6,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Output directories
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set(AMDGPU_STAGE_DIR "${CMAKE_BINARY_DIR}/package/$<CONFIG>")
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${AMDGPU_STAGE_DIR}/bin")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
@@ -26,8 +27,8 @@ find_package(Threads REQUIRED)
 # Provide the directory via the AMDGPU_PKG_ROOT env var (preferred) or
 # -DAMDGPU_PKG_ROOT=...
 # ---------------------------------------------------------------------------
-if(DEFINED ENV{AMDGPU_PKG_ROOT})
-    set(AMDGPU_PKG_ROOT "$ENV{AMDGPU_PKG_ROOT}" CACHE PATH "Path to extracted gpu-test-package" FORCE)
+if(NOT DEFINED AMDGPU_PKG_ROOT AND DEFINED ENV{AMDGPU_PKG_ROOT})
+    set(AMDGPU_PKG_ROOT "$ENV{AMDGPU_PKG_ROOT}" CACHE PATH "Path to extracted HIP EP package")
 endif()
 if(NOT DEFINED AMDGPU_PKG_ROOT)
     message(FATAL_ERROR "AMDGPU_PKG_ROOT is not set. Point it at the extracted "
@@ -35,8 +36,11 @@ if(NOT DEFINED AMDGPU_PKG_ROOT)
         "or set the AMDGPU_PKG_ROOT environment variable.")
 endif()
 
-# Pinned OGA version whose headers we vendor (package ships OGA 0.14.0).
-set(OGA_VERSION "0.14.0")
+get_filename_component(AMDGPU_PKG_ROOT "${AMDGPU_PKG_ROOT}" ABSOLUTE)
+set(HIP_EP_VERSION "0.5.3")
+set(ORT_VERSION "1.31.0")
+set(OGA_VERSION "0.19.0")
+set(OGA_RUNTIME_PATCH "2875")
 
 # ---------------------------------------------------------------------------
 # Locate / prepare the ONNX Runtime GenAI import target (OGA_LIB).
@@ -79,6 +83,7 @@ if(WIN32)
     message(STATUS "Generated OGA import lib: ${OGA_LIB}")
 else()
     set(AMDGPU_PKG_LIB "${AMDGPU_PKG_ROOT}/lib")
+    unset(OGA_LIB CACHE)
     find_library(OGA_LIB
         NAMES onnxruntime-genai
         PATHS "${AMDGPU_PKG_LIB}"
@@ -90,42 +95,83 @@ else()
 endif()
 
 # Vendor OGA C/C++ headers matching the package version (not shipped in it).
-set(OGA_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/external/oga")
+set(OGA_INCLUDE_DIR "${CMAKE_BINARY_DIR}/_deps/oga-${OGA_VERSION}/include"
+    CACHE PATH "OGA headers matching HIP EP ${HIP_EP_VERSION}, including any public API changes from PR ${OGA_RUNTIME_PATCH}")
 foreach(HDR ort_genai.h ort_genai_c.h)
-    if(NOT EXISTS "${OGA_INCLUDE}/${HDR}")
+    if(NOT EXISTS "${OGA_INCLUDE_DIR}/${HDR}")
         message(STATUS "Downloading ${HDR} (v${OGA_VERSION})...")
         file(DOWNLOAD
             "https://raw.githubusercontent.com/microsoft/onnxruntime-genai/v${OGA_VERSION}/src/${HDR}"
-            "${OGA_INCLUDE}/${HDR}"
+            "${OGA_INCLUDE_DIR}/${HDR}"
             SHOW_PROGRESS
+            TLS_VERIFY ON
             STATUS HDR_DOWNLOAD_STATUS
         )
         list(GET HDR_DOWNLOAD_STATUS 0 HDR_DOWNLOAD_CODE)
         if(NOT HDR_DOWNLOAD_CODE EQUAL 0)
-            message(FATAL_ERROR "Failed to download ${HDR}: ${HDR_DOWNLOAD_STATUS}")
+            file(REMOVE "${OGA_INCLUDE_DIR}/${HDR}")
+            message(FATAL_ERROR "Failed to download OGA ${OGA_VERSION} ${HDR}: ${HDR_DOWNLOAD_STATUS}. "
+                "Use -DOGA_INCLUDE_DIR=/path/to/matching/headers for an offline build.")
         endif()
     endif()
 endforeach()
 
+file(SHA256 "${OGA_INCLUDE_DIR}/ort_genai.h" OGA_CXX_HEADER_SHA256)
+file(SHA256 "${OGA_INCLUDE_DIR}/ort_genai_c.h" OGA_C_HEADER_SHA256)
+set(OGA_HEADER_VERSION "unknown")
+set(OGA_HEADER_SOURCE "user-provided snapshot")
+if(OGA_CXX_HEADER_SHA256 STREQUAL "34062055a4def20bd0ce1316c3bea1e207bc5a959abe425a30e4494a7d7b72fb"
+        AND OGA_C_HEADER_SHA256 STREQUAL "75e2681365e87f0f40f7098d28d9b3e65a8a62f306b270cecc338e8caa8b9a70")
+    set(OGA_HEADER_VERSION "0.14.0")
+    set(OGA_HEADER_SOURCE "recovered v0.14.0 snapshot, amd_runtime_server commit 580ba9f651fdf4d5f432aee9f76984d86faee6de")
+endif()
+message(STATUS "OGA header snapshot: ${OGA_HEADER_VERSION}; compatibility with runtime PR ${OGA_RUNTIME_PATCH} is unverified")
+
 # Header-only deps
-set(HTTPLIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/cpp-httplib")
+set(HTTPLIB_DIR "${CMAKE_BINARY_DIR}/_deps/cpp-httplib-0.26.0")
 if(NOT EXISTS "${HTTPLIB_DIR}/httplib.h")
     message(STATUS "Downloading cpp-httplib...")
     file(DOWNLOAD
         "https://raw.githubusercontent.com/yhirose/cpp-httplib/v0.26.0/httplib.h"
         "${HTTPLIB_DIR}/httplib.h"
+        EXPECTED_HASH SHA256=4a42da28ce477d06f53942c172197d3b83b4fe42b7e37b8af78c70e063c06da7
         SHOW_PROGRESS
+        TLS_VERIFY ON
+        STATUS HTTPLIB_DOWNLOAD_STATUS
     )
+    list(GET HTTPLIB_DOWNLOAD_STATUS 0 HTTPLIB_DOWNLOAD_CODE)
+    if(NOT HTTPLIB_DOWNLOAD_CODE EQUAL 0)
+        file(REMOVE "${HTTPLIB_DIR}/httplib.h")
+        message(FATAL_ERROR "Failed to download cpp-httplib: ${HTTPLIB_DOWNLOAD_STATUS}")
+    endif()
 endif()
 
-set(JSON_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/json")
+file(SHA256 "${HTTPLIB_DIR}/httplib.h" HTTPLIB_SHA256)
+if(NOT HTTPLIB_SHA256 STREQUAL "4a42da28ce477d06f53942c172197d3b83b4fe42b7e37b8af78c70e063c06da7")
+    message(FATAL_ERROR "cpp-httplib v0.26.0 header SHA256 mismatch")
+endif()
+
+set(JSON_DIR "${CMAKE_BINARY_DIR}/_deps/json-3.11.3")
 if(NOT EXISTS "${JSON_DIR}/json.hpp")
     message(STATUS "Downloading nlohmann/json...")
     file(DOWNLOAD
         "https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp"
         "${JSON_DIR}/json.hpp"
+        EXPECTED_HASH SHA256=9bea4c8066ef4a1c206b2be5a36302f8926f7fdc6087af5d20b417d0cf103ea6
         SHOW_PROGRESS
+        TLS_VERIFY ON
+        STATUS JSON_DOWNLOAD_STATUS
     )
+    list(GET JSON_DOWNLOAD_STATUS 0 JSON_DOWNLOAD_CODE)
+    if(NOT JSON_DOWNLOAD_CODE EQUAL 0)
+        file(REMOVE "${JSON_DIR}/json.hpp")
+        message(FATAL_ERROR "Failed to download nlohmann/json: ${JSON_DOWNLOAD_STATUS}")
+    endif()
+endif()
+
+file(SHA256 "${JSON_DIR}/json.hpp" JSON_SHA256)
+if(NOT JSON_SHA256 STREQUAL "9bea4c8066ef4a1c206b2be5a36302f8926f7fdc6087af5d20b417d0cf103ea6")
+    message(FATAL_ERROR "nlohmann/json v3.11.3 header SHA256 mismatch")
 endif()
 
 set(SOURCES
@@ -142,7 +188,7 @@ add_executable(amdgpu-server ${SOURCES})
 
 target_include_directories(amdgpu-server PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${OGA_INCLUDE}
+    ${OGA_INCLUDE_DIR}
     ${HTTPLIB_DIR}
     ${JSON_DIR}
 )
@@ -162,44 +208,15 @@ if(WIN32)
     target_link_libraries(amdgpu-server PRIVATE ws2_32 wbemuuid ole32 oleaut32 shell32)
     set_target_properties(amdgpu-server PROPERTIES LINK_FLAGS "/SUBSYSTEM:CONSOLE")
 
-    # Copy the whole package bin/ (EP DLLs, ROCm runtime, rocblas/, hipblaslt/,
-    # hipdnn_plugins/) next to the exe so the loader resolves everything from its
-    # own directory.
-    add_custom_command(TARGET amdgpu-server POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
-            "${AMDGPU_PKG_BIN}" "$<TARGET_FILE_DIR:amdgpu-server>"
-        COMMENT "Copying AMD GPU package runtime (DLLs + ROCm + EP) next to amdgpu-server.exe"
-    )
-
-    add_custom_command(TARGET amdgpu-server POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${CMAKE_CURRENT_SOURCE_DIR}/AMD_LICENSE
-            $<TARGET_FILE_DIR:amdgpu-server>/AMD_LICENSE
-        COMMENT "Copying AMD_LICENSE"
-    )
 else()
     # Linux: resolve the package .so via $ORIGIN so the binary is relocatable.
     # Use DT_RPATH (not DT_RUNPATH) so the path also applies to transitive deps.
     target_link_libraries(amdgpu-server PRIVATE ${CMAKE_DL_LIBS})
     target_link_options(amdgpu-server PRIVATE "-Wl,--disable-new-dtags")
     set_target_properties(amdgpu-server PROPERTIES
-        BUILD_RPATH "$ORIGIN"
-        INSTALL_RPATH "$ORIGIN"
-    )
-
-    # Copy the package runtime .so (preserving the SONAME symlink chain) and the
-    # bin/ JIT toolchain (clang / lld / hip-compiler, used by the EP at runtime)
-    # next to the binary. cp -a preserves symlinks that individual copies lose.
-    add_custom_command(TARGET amdgpu-server POST_BUILD
-        COMMAND bash -c "cp -a '${AMDGPU_PKG_ROOT}/lib/.' '$<TARGET_FILE_DIR:amdgpu-server>/' && cp -a '${AMDGPU_PKG_ROOT}/bin/.' '$<TARGET_FILE_DIR:amdgpu-server>/'"
-        COMMENT "Copying AMD GPU package runtime (.so + JIT toolchain) next to amdgpu-server"
-    )
-
-    add_custom_command(TARGET amdgpu-server POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${CMAKE_CURRENT_SOURCE_DIR}/AMD_LICENSE
-            $<TARGET_FILE_DIR:amdgpu-server>/AMD_LICENSE
-        COMMENT "Copying AMD_LICENSE"
+        BUILD_RPATH "$ORIGIN/../lib"
+        INSTALL_RPATH "$ORIGIN/../lib"
+        BUILD_WITH_INSTALL_RPATH TRUE
     )
 endif()
 
@@ -207,7 +224,22 @@ if(MSVC)
     target_compile_options(amdgpu-server PRIVATE /W4)
 endif()
 
+configure_file(tools/runtime-versions.json.in runtime-versions.json @ONLY)
+add_custom_target(stage_runtime ALL
+    COMMAND "${CMAKE_COMMAND}"
+        "-DPACKAGE_ROOT=${AMDGPU_PKG_ROOT}"
+        "-DDESTINATION=${AMDGPU_STAGE_DIR}"
+        "-DSOURCE_ROOT=${CMAKE_CURRENT_SOURCE_DIR}"
+        "-DVERSION_FILE=${CMAKE_BINARY_DIR}/runtime-versions.json"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/tools/stage_runtime.cmake"
+    DEPENDS amdgpu-server
+    COMMENT "Preserving HIP EP package directories, symlinks, permissions, and licenses"
+    VERBATIM
+)
+
+install(DIRECTORY "${AMDGPU_PKG_ROOT}/" DESTINATION . USE_SOURCE_PERMISSIONS)
 install(TARGETS amdgpu-server RUNTIME DESTINATION bin)
+install(FILES LICENSE AMD_LICENSE "${CMAKE_BINARY_DIR}/runtime-versions.json" DESTINATION .)
 
 message(STATUS "==========================================================")
 message(STATUS "AMD GPU LLM Server Configuration:")
