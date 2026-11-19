@@ -19,7 +19,7 @@ Run with Python 3.11 or later. The runner uses only the standard library and own
 ```sh
 python test/smoke.py --server-exe /path/to/package/bin/amdgpu-server \
   --model /path/to/model --evidence /path/to/new-results-directory \
-  --ctx-size 4096 --max-tokens 256 --port 18081
+  --ctx-size 4096 --max-tokens 256 --port 18081 --cache-checks
 ```
 
 | Check | Required observation |
@@ -27,12 +27,16 @@ python test/smoke.py --server-exe /path/to/package/bin/amdgpu-server \
 | Startup and health | The owned process remains alive; health reports GPU configuration. |
 | Actual HIP execution | Model selects AMDGPU profile `hip`; runtime logs or profiling establish provider dispatch; CPU fallback is disabled where supported. |
 | Chat JSON and SSE | Nonempty final-answer text, finish reason, positive token count for JSON, valid SSE JSON and `[DONE]`. Reasoning-only output fails the final-answer check. |
-| Conversation | A second turn recalls a supplied code; reset succeeds; a new conversation answers its own request without the previous code. |
+| Conversation | A second turn recalls a supplied code; reset succeeds; a new conversation answers its own request without the previous code. With `--cache-checks`, repeated prompts both return usable answers and unrelated prompts return their own distinct codes. |
 | Recovery | Malformed JSON returns HTTP 400; disconnect after a generated SSE token; subsequent requests return usable output. |
 | Completions and Responses | Both JSON and SSE produce text and terminal records. |
 | Tool calls | A tool-capable model returns a parseable named function with schema-valid arguments, then consumes the tool result. Run separately before advertising tool support. |
 | Limits and concurrency | Oversized prompt and concurrent requests produce bounded behavior without a crash or conversation leakage. Run separately before release. |
 | Repeated lifecycle | Repeat model load, request, unload, reload; confirm resource reclamation and stable behavior. |
+
+The runner snapshots each serialized request before sending it. Run `python -m unittest discover -s test -p test_smoke.py -v` to verify that later changes to a conversation do not alter saved request evidence. Historical results captured before this correction can show later messages in the first-turn request record. Preserve those records and annotate this limitation.
+
+A reasoning model can exhaust its output budget before it produces final-answer text. Keep that failure, then run a separately labeled diagnostic with a larger budget. The diagnostic does not replace the original result or establish general conversation correctness.
 
 The automated smoke runner covers basic API behavior and recovery. The last three rows and provider-dispatch proof require additional release validation. A model-dependent failure is recorded, then investigated with the same package and another supported model if available. Do not change baseline inference code to conceal it.
 

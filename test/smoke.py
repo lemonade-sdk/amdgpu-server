@@ -31,9 +31,10 @@ class Smoke:
         self.exchanges = []
 
     def request(self, path, body=None, *, stream=False, cancel=False, expected=200):
-        record = {"path": path, "request": body, "cancel_after_output": cancel}
-        self.exchanges.append(record)
         payload = body if isinstance(body, str) else json.dumps(body)
+        record = {"path": path, "request": body if isinstance(body, str) else json.loads(payload),
+                  "cancel_after_output": cancel}
+        self.exchanges.append(record)
         connection = http.client.HTTPConnection("127.0.0.1", self.args.port,
                                                 timeout=self.args.request_timeout)
         deadline = time.monotonic() + self.args.request_timeout
