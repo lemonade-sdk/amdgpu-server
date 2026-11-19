@@ -1,0 +1,9 @@
+foreach(required PACKAGE_ROOT DESTINATION SOURCE_ROOT VERSION_FILE)
+    if(NOT DEFINED ${required})
+        message(FATAL_ERROR "Missing ${required}")
+    endif()
+endforeach()
+
+file(COPY "${PACKAGE_ROOT}/" DESTINATION "${DESTINATION}" USE_SOURCE_PERMISSIONS)
+file(COPY "${SOURCE_ROOT}/LICENSE" "${SOURCE_ROOT}/AMD_LICENSE" "${VERSION_FILE}"
+    DESTINATION "${DESTINATION}")

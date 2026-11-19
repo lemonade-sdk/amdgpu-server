@@ -25,7 +25,7 @@ The AMDGPU EP is selected entirely by the model. A model runs on the GPU when it
 `genai_config.json` sets:
 
 ```json
-"provider_options": [ { "AMDGPU": { "profile": "llm" } } ]
+"provider_options": [ { "AMDGPU": { "profile": "hip" } } ]
 ```
 
 The server is a thin OGA wrapper: it loads the model with `OgaModel::Create`,
@@ -34,42 +34,80 @@ to fold decoded images into the prompt.
 
 ## Prerequisites
 
-- **Windows 11 (x64)**
+- **Windows 11 or Linux, x64**
 - **AMD GPU, gfx1151 (Strix Halo)**, with the AMD graphics driver installed
   (provides `amdhip64_7.dll`)
-- **Visual Studio 2022 or 2026**, **CMake 3.20+**
-- The **AMD GPU package** — from the [ROCm/hip-ep releases](https://github.com/ROCm/hip-ep/releases):
-  download `gpu-test-package-windows-<version>.zip`, extract it, and point
-  `AMDGPU_PKG_ROOT` at the extracted directory (it must contain
-  `bin/onnxruntime-genai.dll`). This package ships `onnxruntime-genai.dll`, the
-  AMDGPU/hipep EP, and the ROCm runtime DLLs.
+- **Visual Studio 2022** on Windows, or a C++17 compiler on Linux, and **CMake 3.20+**
+- The [HIP EP v0.5.3 runtime](https://github.com/ROCm/hip-ep/releases/tag/v0.5.3),
+  with ONNX Runtime 1.31.0 and OGA 0.19.0 plus upstream PR 2875
+- On Linux, **TheRock 10.1.0 for gfx1151** and a compatible AMD GPU driver.
+  The upstream HIP EP Linux archive excludes TheRock libraries. Configure the
+  host's library search path for that runtime before loading the server.
 
-> The package ships the OGA DLL but **no import library and no OGA headers**, so
-> the build (a) synthesizes `onnxruntime-genai.lib` from the DLL's exports via
-> `tools/gen_oga_import_lib.ps1` (dumpbin → .def → lib.exe) and (b) vendors the
-> matching upstream OGA C/C++ headers (v0.14.0) into `external/oga`.
+Download the archive for your platform, verify its SHA256, and extract it.
+Point `AMDGPU_PKG_ROOT` at the directory containing `bin/` and `lib/`.
+
+| Platform | HIP EP archive | SHA256 |
+|----------|----------------|--------|
+| Windows x64 | `hipep_0.5.3_windows.zip` | `ee1aadbf46142b1a4804fae531a6bc476966eca07e301f75310084f8e32f3c07` |
+| Linux x64 | `hipep_0.5.3_linux.zip` | `d0f72eb9b477c5fa990f4142f65a7c959d54a32f38bd936b9f8aa7581849ec76` |
+
+The Windows package contains the OGA DLL without its import library. The build
+generates `onnxruntime-genai.lib` with `tools/gen_oga_import_lib.ps1` and the
+MSVC tools. Both platform packages omit the OGA C and C++ headers.
 
 ## Building
 
 ```powershell
 # Point at the extracted AMD GPU package (contains bin\onnxruntime-genai.dll)
-$env:AMDGPU_PKG_ROOT = "C:\path\to\gpu-test-package"
-#   ... or pass -DAMDGPU_PKG_ROOT=C:\path\to\gpu-test-package to cmake
+$env:AMDGPU_PKG_ROOT = "C:\path\to\hipep_0.5.3_windows"
 
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64      # or "Visual Studio 18 2026"
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
 ```
 
-Output: `build\bin\Release\amdgpu-server.exe`, with the package's EP/ROCm/OGA DLLs
-copied next to it (so the loader resolves everything from the exe's own directory).
+On Linux:
 
-Header-only deps (cpp-httplib, nlohmann/json) and the OGA headers are downloaded
-into `external/` at configure time.
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+    -DAMDGPU_PKG_ROOT=/path/to/hipep_0.5.3_linux
+cmake --build build -j"$(nproc)"
+```
+
+The server is at `build/package/Release/bin/amdgpu-server.exe` on Windows or
+`build/package/Release/bin/amdgpu-server` on Linux. The complete upstream package
+tree is at `build/package/Release/`. The build preserves runtime directories,
+symlinks, compiler resources, and configuration files. Linux resolves bundled
+libraries relative to `bin/` through `$ORIGIN/../lib`.
+
+Header-only dependencies and the OGA headers download into versioned directories
+under `build/_deps/` at configure time. Existing `external/oga` files are ignored.
+For an offline build, provide matching OGA headers with
+`-DOGA_INCLUDE_DIR=/path/to/headers`. The runtime uses OGA 0.19.0 with PR 2875.
+Check that the header snapshot includes any public API changes from that patch.
+
+As of November 19, 2026, the official OGA 0.19.0 header and PR 2875 URLs return
+HTTP 404. A clean build requires a recovered matching header snapshot until
+those sources are available. Older headers are not a verified substitute.
+The manifest records both header SHA256 values, the identified snapshot version,
+and its provenance. Header compatibility remains marked `unverified` until the
+matching runtime patch can be inspected.
+
+To stage an install, run `cmake --install build --config Release --prefix dist`.
+Verify the package before distributing it:
+
+```bash
+python tools/verify_package.py --platform linux \
+    --runtime-root /path/to/hipep_0.5.3_linux --package-root dist
+```
+
+For Windows, use `--platform windows`. The verifier compares every upstream file
+and symlink with the staged package and checks executable permissions on Linux.
 
 ## Running
 
 ```powershell
-build\bin\Release\amdgpu-server.exe -m C:\path\to\onnx-model --port 8080 --verbose
+build\package\Release\bin\amdgpu-server.exe -m C:\path\to\onnx-model --port 8080 --verbose
 ```
 
 | Flag | Meaning |
@@ -134,21 +172,27 @@ recipe. Both are `DEVICE_GPU` and can be loaded concurrently.
 
 ## Releases
 
-`amdgpu-server.zip` releases (the artifact Lemonade downloads) are built by CI
-(`.github/workflows/build_and_release.yml`): a Windows runner downloads the
-`gpu-test-package-windows` asset from [ROCm/hip-ep](https://github.com/ROCm/hip-ep/releases)
-(pinned by `HIP_EP_VERSION`), builds `amdgpu-server.exe`, and bundles it with the
-EP / ROCm / OGA runtime DLLs. Pushing a `v*` tag publishes a GitHub release with
-`amdgpu-server.zip` attached. Lemonade resolves it via
-`lemonade-sdk/amdgpu-server` → `amdgpu-server.zip` at the version pinned in
-Lemonade's `backend_versions.json`.
+The release workflow uses self-hosted Windows and Linux runners in `dev_lab`.
+It verifies the pinned HIP EP archive hash, builds the server, checks the
+complete runtime tree, then extracts and checks the distributable archive.
+The smoke check runs `--help` and loads OGA. Hardware inference is a separate
+acceptance check on gfx1151.
 
-Note: CI builds on GitHub-hosted runners (no AMD GPU), so it validates
-compilation and packaging only; runtime is validated on gfx1151 hardware.
+Pushing a `v*` tag publishes these assets with SHA256 sidecars:
+
+| Platform | Server archive | Executable inside the archive |
+|----------|----------------|-------------------------------|
+| Windows x64 | `amdgpu-server-windows-x64.zip` | `bin/amdgpu-server.exe` |
+| Linux x64 | `amdgpu-server-linux-x64.tar.gz` | `bin/amdgpu-server` |
+
+Each archive preserves the upstream HIP EP package tree and includes
+`runtime-versions.json`, `LICENSE`, and `AMD_LICENSE`. Lemonade's installer
+discovers the executable recursively. Its backend release pin must use the
+matching platform filename and archive hash.
 
 ## License
 
-Source code is **MIT** (see `LICENSE`). The AMD GPU runtime DLLs copied next to the
-binary at build time are licensed under the **AMD Software End User License
-Agreement** (see `AMD_LICENSE`); they are not part of this repository and are not
-redistributed here.
+Source code is **MIT**, as stated in `LICENSE`. The packaged AMD GPU runtime is
+subject to the **AMD Software End User License Agreement** in `AMD_LICENSE` and
+the applicable licenses of its upstream components. The staging step retains
+any license files present in the HIP EP archive.
