@@ -142,6 +142,20 @@ class Smoke:
         require("BLUE942" in answer["content"] and "ORANGE731" not in answer["content"],
                 "New conversation answer is wrong or contains prior conversation code")
 
+    def repeated_chat(self):
+        self.request("/v1/sessions/reset", {})
+        first = self.chat()
+        second = self.chat()
+        require("hello" in first["content"].lower() and "hello" in second["content"].lower(),
+                "Repeated prompt did not produce two usable answers")
+
+    def conversation_isolation(self):
+        for code, other in (("RED361", "GREEN482"), ("GREEN482", "RED361")):
+            messages = [{"role": "user", "content": f"Reply only {code}. /no_think"}]
+            answer = self.chat(messages)["content"]
+            require(code in answer and other not in answer,
+                    "Independent conversation returned the wrong code or leaked prior context")
+
     def invalid_then_recovery(self):
         result = self.request("/v1/chat/completions", "{invalid", expected=400)
         require("error" in result, "Malformed JSON did not return an error object")
@@ -187,6 +201,8 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--startup-timeout", type=float, default=300)
     parser.add_argument("--request-timeout", type=float, default=120)
+    parser.add_argument("--cache-checks", action="store_true",
+                        help="Also check repeated prompts and independent conversations")
     args = parser.parse_args()
     args.server_exe = args.server_exe.resolve(strict=True)
     args.model = args.model.resolve(strict=True)
@@ -233,6 +249,9 @@ def main():
             for stream in (False, True):
                 smoke.case(f"completions_stream_{stream}", lambda: smoke.completions(stream))
                 smoke.case(f"responses_stream_{stream}", lambda: smoke.responses(stream))
+            if args.cache_checks:
+                smoke.case("repeated_chat", smoke.repeated_chat)
+                smoke.case("conversation_isolation", smoke.conversation_isolation)
     except Exception as error:
         smoke.results.append({"name": "server_lifecycle", "status": "fail", "error": str(error)})
         print(f"fail: server_lifecycle {error}", flush=True)
