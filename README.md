@@ -58,6 +58,12 @@ MSVC tools. Both platform packages omit the OGA C and C++ headers.
 
 ## Building
 
+The HIP EP 0.5.3 baseline is experimental. Windows builds and basic inference
+work, but sequential chat requests with Qwen3.5 fail when the server partially
+rewinds recurrent state. See [baseline results](docs/hip053-baseline-results.md)
+and the [release test plan](docs/test-plan.md). Tag builds create draft
+prereleases until the compatibility and application validation gates pass.
+
 ```powershell
 # Point at the extracted AMD GPU package (contains bin\onnxruntime-genai.dll)
 $env:AMDGPU_PKG_ROOT = "C:\path\to\hipep_0.5.3_windows"

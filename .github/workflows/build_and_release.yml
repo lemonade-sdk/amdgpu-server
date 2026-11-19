@@ -195,7 +195,7 @@ jobs:
             Requires an AMD gfx1151 (Strix Halo) GPU. Windows requires the AMD
             graphics driver. Linux also requires the compatible TheRock 10.1.0
             runtime, which upstream leaves outside its archive.
-          draft: false
-          prerelease: false
+          draft: true
+          prerelease: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

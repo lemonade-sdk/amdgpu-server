@@ -124,9 +124,6 @@ if(OGA_CXX_HEADER_SHA256 STREQUAL "34062055a4def20bd0ce1316c3bea1e207bc5a959abe4
         AND OGA_C_HEADER_SHA256 STREQUAL "75e2681365e87f0f40f7098d28d9b3e65a8a62f306b270cecc338e8caa8b9a70")
     set(OGA_HEADER_VERSION "0.14.0")
     set(OGA_HEADER_SOURCE "recovered v0.14.0 snapshot, amd_runtime_server commit 580ba9f651fdf4d5f432aee9f76984d86faee6de")
-elseif(OGA_INCLUDE_DIR STREQUAL "${CMAKE_BINARY_DIR}/_deps/oga-${OGA_VERSION}/include")
-    set(OGA_HEADER_VERSION "${OGA_VERSION}")
-    set(OGA_HEADER_SOURCE "microsoft/onnxruntime-genai v${OGA_VERSION}")
 endif()
 message(STATUS "OGA header snapshot: ${OGA_HEADER_VERSION}; compatibility with runtime PR ${OGA_RUNTIME_PATCH} is unverified")
 
