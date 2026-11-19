@@ -53,6 +53,13 @@ GPU event measurements and operation tables. Together with the selected HIP
 profile, this establishes actual HIP execution for the successful requests.
 These runs are not performance comparisons.
 
+On Linux, all seven source files compiled with GCC 13.3 and the same OGA 0.14
+headers. Linking failed because the upstream OGA library imports
+`sqrtf@GLIBC_2.43` and `log10f@GLIBC_2.43`, while the build host has glibc 2.39.
+The upstream ONNX Runtime library also requires `GLIBCXX_3.4.34`.
+No Linux server package or GPU test passed on this host. A compatible host image
+and the external TheRock runtime remain prerequisites.
+
 ## BASELINE-1: recurrent-state rewind blocks conversations
 
 The server computes a longest shared token prefix in `prepareTextGenerator`
@@ -83,3 +90,7 @@ Shi Li's PRs remain separate candidates. PR #1 changes inference and cache
 behavior from an older base. PR #2 changes tool-call parsing, emission, tests
 and packaging; its current diff does not change `inference_engine.cpp` and does
 not address BASELINE-1. Neither PR was merged as part of the baseline.
+
+PR #2's standalone tool-call regression suite at commit
+`196549807f2ad7b3b495fd201fca29c5b939378e` compiled with GCC 13.3 and passed.
+That result covers parsing and formatting, with no full-server GPU comparison.

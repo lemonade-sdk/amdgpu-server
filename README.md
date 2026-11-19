@@ -36,13 +36,15 @@ to fold decoded images into the prompt.
 
 - **Windows 11 or Linux, x64**
 - **AMD GPU, gfx1151 (Strix Halo)**, with the AMD graphics driver installed
-  (provides `amdhip64_7.dll`)
 - **Visual Studio 2022** on Windows, or a C++17 compiler on Linux, and **CMake 3.20+**
 - The [HIP EP v0.5.3 runtime](https://github.com/ROCm/hip-ep/releases/tag/v0.5.3),
   with ONNX Runtime 1.31.0 and OGA 0.19.0 plus upstream PR 2875
 - On Linux, **TheRock 10.1.0 for gfx1151** and a compatible AMD GPU driver.
   The upstream HIP EP Linux archive excludes TheRock libraries. Configure the
   host's library search path for that runtime before loading the server.
+- The Linux v0.5.3 binaries require **GLIBC_2.43** and **GLIBCXX_3.4.34**.
+  Use a host image that supplies these symbols. The tested Ubuntu host with
+  glibc 2.39 compiled the server sources but could not link the upstream OGA library.
 
 Download the archive for your platform, verify its SHA256, and extract it.
 Point `AMDGPU_PKG_ROOT` at the directory containing `bin/` and `lib/`.
