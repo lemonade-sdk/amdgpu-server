@@ -33,10 +33,8 @@ public:
     
     // Synchronous completion
     // Returns generated text. If out_timing is provided, stores timing data.
-    // reuse_kv: reuse the KV cache across calls via a persistent generator with
-    // longest-common-prefix reuse. Correct for any request sequence (unrelated
-    // prompts rewind to their divergence point), so it defaults on; call
-    // resetChatSession() to start a fresh conversation.
+    // reuse_kv: reuse the generator for a strict extension of its cached tokens.
+    // Other prompts recreate it. resetChatSession() drops the persistent cache.
     std::string complete(const std::string& prompt, const GenerationParams& params,
                          CompletionTimingData* out_timing = nullptr, bool reuse_kv = true);
 
@@ -95,10 +93,8 @@ private:
     std::vector<int32_t> truncatePrompt(const std::vector<int32_t>& input_ids);
     bool validateModelDirectory(const std::string& path);
 
-    // Prepare the generator for a text-completion pass. For reuse_kv, uses the
-    // persistent chat generator (rewind to the longest common prefix, then append
-    // only the new tokens); otherwise builds a fresh generator held in `owned`.
-    // Returns the generator to drive.
+    // With reuse_kv, append only to a strict token-prefix match; recreate otherwise.
+    // Without reuse_kv, return a fresh generator held in `owned`.
     OgaGenerator* prepareTextGenerator(const std::vector<int32_t>& input_ids,
                                        const GenerationParams& params, bool reuse_kv,
                                        std::unique_ptr<OgaGenerator>& owned);
@@ -137,4 +133,3 @@ private:
 };
 
 } // namespace ryzenai
-
