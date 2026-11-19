@@ -1,4 +1,5 @@
 #include "ryzenai/inference_engine.h"
+#include <algorithm>
 #include <ort_genai.h>
 #include <ort_genai_c.h>
 #include <filesystem>
@@ -510,7 +511,11 @@ OgaGenerator* InferenceEngine::prepareTextGenerator(const std::vector<int32_t>& 
         chat_repetition_penalty_ != params.repetition_penalty ||
         chat_do_sample_ != params.do_sample;
 
-    if (!chat_generator_ || params_changed) {
+    bool cached_is_strict_prefix =
+        chat_cached_tokens_.size() < input_ids.size() &&
+        std::equal(chat_cached_tokens_.begin(), chat_cached_tokens_.end(), input_ids.begin());
+
+    if (!chat_generator_ || params_changed || !cached_is_strict_prefix) {
         int ctx = (model_context_length_ > 0) ? model_context_length_ : max_prompt_length_;
         int need = static_cast<int>(input_ids.size()) + params.max_length;
         if (ctx < need) ctx = need;
@@ -526,23 +531,15 @@ OgaGenerator* InferenceEngine::prepareTextGenerator(const std::vector<int32_t>& 
         chat_do_sample_ = params.do_sample;
     }
 
-    // Longest common prefix between the cached sequence and the new prompt.
-    size_t common = 0;
-    while (common < chat_cached_tokens_.size() && common < input_ids.size() &&
-           chat_cached_tokens_[common] == input_ids[common]) {
-        ++common;
-    }
-    // Discard KV beyond the shared prefix, then append only the new suffix.
-    if (chat_cached_tokens_.size() > common) {
-        chat_generator_->RewindTo(common);
-    }
-    if (input_ids.size() > common) {
-        chat_generator_->AppendTokens(input_ids.data() + common, input_ids.size() - common);
+    size_t reused = chat_cached_tokens_.size();
+    size_t appended = input_ids.size() - reused;
+    if (appended > 0) {
+        chat_generator_->AppendTokens(input_ids.data() + reused, appended);
     }
     chat_cached_tokens_.assign(input_ids.begin(), input_ids.end());
     std::cout << "[InferenceEngine] KV reuse: prompt=" << input_ids.size()
-              << " reused_prefix=" << common
-              << " appended=" << (input_ids.size() - common) << std::endl;
+              << " reused_prefix=" << reused
+              << " appended=" << appended << std::endl;
     return chat_generator_.get();
 }
 
