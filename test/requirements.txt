@@ -1,4 +1,4 @@
-# RyzenAI Server Test Requirements
+# AMD GPU Server Test Requirements
 openai>=1.0.0
 requests>=2.28.0
 httpx>=0.25.0

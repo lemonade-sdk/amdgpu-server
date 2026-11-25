@@ -465,12 +465,33 @@ std::vector<int32_t> InferenceEngine::truncatePrompt(const std::vector<int32_t>&
     );
 }
 
+namespace {
+// Decodes the tokens added to the sequence since `decoded_count` and advances it.
+// The step that ends generation adds no token, so it yields no text.
+std::string decodeNewTokens(OgaGenerator& generator, OgaTokenizerStream& stream,
+                            size_t& decoded_count) {
+    const int32_t* tokens = generator.GetSequenceData(0);
+    const size_t count = generator.GetSequenceCount(0);
+    std::string text;
+    for (; decoded_count < count; ++decoded_count) {
+        if (const char* piece = stream.Decode(tokens[decoded_count])) {
+            text += piece;
+        }
+    }
+    return text;
+}
+}  // namespace
+
 void InferenceEngine::resetChatSession() {
     std::lock_guard<std::mutex> lock(inference_mutex_);
+    discardChatGenerator();
+    std::cout << "[InferenceEngine] Chat KV cache reset" << std::endl;
+}
+
+void InferenceEngine::discardChatGenerator() {
     chat_generator_.reset();
     chat_cached_tokens_.clear();
     chat_params_valid_ = false;
-    std::cout << "[InferenceEngine] Chat KV cache reset" << std::endl;
 }
 
 OgaGenerator* InferenceEngine::prepareTextGenerator(const std::vector<int32_t>& input_ids,
@@ -531,6 +552,11 @@ OgaGenerator* InferenceEngine::prepareTextGenerator(const std::vector<int32_t>& 
     while (common < chat_cached_tokens_.size() && common < input_ids.size() &&
            chat_cached_tokens_[common] == input_ids[common]) {
         ++common;
+    }
+    // Generating straight after a rewind replays a stale token, so a prompt the
+    // cache already covers in full re-feeds its last token.
+    if (common == input_ids.size() && common > 0) {
+        --common;
     }
     // Discard KV beyond the shared prefix, then append only the new suffix.
     if (chat_cached_tokens_.size() > common) {
@@ -649,6 +675,8 @@ std::string InferenceEngine::complete(const std::string& prompt, const Generatio
         return result;
         
     } catch (const std::exception& e) {
+        // A failed turn leaves the persistent generator in an unknown state.
+        if (reuse_kv) discardChatGenerator();
         throw std::runtime_error("Inference failed: " + std::string(e.what()));
     }
 }
@@ -683,23 +711,17 @@ void InferenceEngine::streamComplete(const std::string& prompt,
         auto tokenizer_stream = OgaTokenizerStream::Create(*tokenizer_);
 
         size_t token_count = 0;
+        size_t decoded_count = generator->GetSequenceCount(0);
         std::string accumulated_output;  // Track full output for stop sequence detection
         bool client_disconnected = false;  // Track if client disconnected
 
         while (!generator->IsDone() && !client_disconnected &&
                static_cast<int>(token_count) < params.max_length) {
             generator->GenerateNextToken();
-            
-            // Get just the new token
-            const int32_t* all_tokens = generator->GetSequenceData(0);
-            size_t num_tokens = generator->GetSequenceCount(0);
-            int32_t new_token = all_tokens[num_tokens - 1];
-            
-            // Decode incrementally using tokenizer stream (this works!)
-            const char* decoded = tokenizer_stream->Decode(new_token);
-            if (decoded && decoded[0] != '\0') {
-                std::string token_str(decoded);
-                
+
+            // Decode incrementally using tokenizer stream
+            std::string token_str = decodeNewTokens(*generator, *tokenizer_stream, decoded_count);
+            if (!token_str.empty()) {
                 // Check for stop sequences before accumulating
                 bool should_stop = false;
                 for (const auto& stop_seq : params.stop_sequences) {
@@ -746,6 +768,8 @@ void InferenceEngine::streamComplete(const std::string& prompt,
         std::cout << "[InferenceEngine] Generated " << token_count << " tokens (streaming)" << std::endl;
         
     } catch (const std::exception& e) {
+        // A failed turn leaves the persistent generator in an unknown state.
+        if (reuse_kv) discardChatGenerator();
         throw std::runtime_error("Streaming inference failed: " + std::string(e.what()));
     }
 }
@@ -867,16 +891,14 @@ std::string InferenceEngine::completeMultimodal(const std::string& prompt,
     auto stream = OgaTokenizerStream::Create(*processor_);
     std::string result;
     int generated = 0;
+    size_t decoded_count = generator->GetSequenceCount(0);
     while (!generator->IsDone() && generated < params.max_length) {
         generator->GenerateNextToken();
         if (!first_token_received) {
             first_token_time = std::chrono::high_resolution_clock::now();
             first_token_received = true;
         }
-        const int32_t* toks = generator->GetSequenceData(0);
-        size_t n = generator->GetSequenceCount(0);
-        const char* decoded = stream->Decode(toks[n - 1]);
-        if (decoded && decoded[0] != '\0') result += decoded;
+        result += decodeNewTokens(*generator, *stream, decoded_count);
         generated++;
 
         bool stop_hit = false;
@@ -943,15 +965,13 @@ void InferenceEngine::streamCompleteMultimodal(const std::string& prompt,
     auto stream = OgaTokenizerStream::Create(*processor_);
     std::string accumulated;
     int generated = 0;
+    size_t decoded_count = generator->GetSequenceCount(0);
     bool client_disconnected = false;
     while (!generator->IsDone() && generated < params.max_length && !client_disconnected) {
         generator->GenerateNextToken();
-        const int32_t* toks = generator->GetSequenceData(0);
-        size_t n = generator->GetSequenceCount(0);
-        const char* decoded = stream->Decode(toks[n - 1]);
+        std::string token_str = decodeNewTokens(*generator, *stream, decoded_count);
         generated++;
-        if (decoded && decoded[0] != '\0') {
-            std::string token_str(decoded);
+        if (!token_str.empty()) {
             bool should_stop = false;
             for (const auto& stop_seq : params.stop_sequences) {
                 if ((accumulated + token_str).find(stop_seq) != std::string::npos) { should_stop = true; break; }

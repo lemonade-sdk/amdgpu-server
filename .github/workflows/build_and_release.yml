@@ -11,27 +11,48 @@ permissions:
   contents: write
 
 env:
-  # ROCm/hip-ep release providing the gpu-test-package (AMDGPU/hipep EP + ROCm +
-  # onnxruntime-genai). Bump to build against a newer EP drop.
-  HIP_EP_VERSION: v0.2.0
+  # ROCm/hip-ep release providing the HIP EP package (AMDGPU EP + ROCm runtime +
+  # onnxruntime-genai). To build against a newer EP drop, bump this together
+  # with the package hash, the project version in CMakeLists.txt and the
+  # vendored OGA headers (third_party/onnxruntime-genai).
+  HIP_EP_VERSION: v0.5.3
+  HIP_EP_WINDOWS_SHA256: ee1aadbf46142b1a4804fae531a6bc476966eca07e301f75310084f8e32f3c07
 
 jobs:
+  # tool_calls.cpp has no OGA dependency, so the shared tool-call suite runs on a
+  # plain hosted runner. This keeps the parsing logic covered even when the
+  # GPU-package build jobs are unavailable.
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch nlohmann/json
+        run: |
+          set -euo pipefail
+          mkdir -p external/json
+          curl -fsSL -o external/json/json.hpp             https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp
+
+      - name: Build and run tool-call tests
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -Wall -Wextra -Iinclude -Iexternal/json             test/test_tool_calls.cpp src/tool_calls.cpp -o test_tool_calls
+          ./test_tool_calls
+
   build:
     name: Build (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         include:
+          # Windows only for now: the hip-ep Linux package has not been
+          # validated on hardware yet.
           - os: windows
             asset: amdgpu-server-windows-x64.zip
             runson:
               group: dev_lab
               labels: [self-hosted, Windows, X64]
-          - os: linux
-            asset: amdgpu-server-linux-x64.tar.gz
-            runson:
-              group: dev_lab
-              labels: [self-hosted, Linux, X64]
     runs-on: ${{ matrix.runson }}
     steps:
       - uses: actions/checkout@v4
@@ -39,7 +60,7 @@ jobs:
           clean: true
 
       # ----------------------------- Windows -----------------------------
-      - name: (win) Download hip-ep gpu-test-package
+      - name: (win) Download hip-ep package
         if: runner.os == 'Windows'
         shell: powershell
         run: |
@@ -49,9 +70,11 @@ jobs:
           $ProgressPreference = "SilentlyContinue"
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
           $ver = "${{ env.HIP_EP_VERSION }}"
-          $url = "https://github.com/ROCm/hip-ep/releases/download/$ver/gpu-test-package-windows-$ver.zip"
+          $url = "https://github.com/ROCm/hip-ep/releases/download/$ver/hipep_$($ver.TrimStart('v'))_windows.zip"
           Write-Host "Downloading $url"
           Invoke-WebRequest -Uri $url -OutFile pkg.zip -UseBasicParsing
+          $hash = (Get-FileHash -Path pkg.zip -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne "${{ env.HIP_EP_WINDOWS_SHA256 }}") { throw "pkg.zip SHA256 mismatch: $hash" }
           if (Test-Path pkg) { Remove-Item -Recurse -Force pkg }
           Expand-Archive -Path pkg.zip -DestinationPath pkg -Force
           $dll = Get-ChildItem -Path pkg -Recurse -Filter onnxruntime-genai.dll | Select-Object -First 1
@@ -65,64 +88,28 @@ jobs:
           $ErrorActionPreference = "Stop"
           cmake -S . -B build -G "Visual Studio 17 2022" -A x64
           cmake --build build --config Release
-          if (-not (Test-Path build\bin\Release\amdgpu-server.exe)) { throw "amdgpu-server.exe missing" }
+          if (-not (Test-Path build\package\Release\bin\amdgpu-server.exe)) { throw "amdgpu-server.exe missing" }
+
+      - name: (win) Unit tests
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          ctest --test-dir build -C Release --output-on-failure
 
       - name: (win) Smoke test (loads onnxruntime-genai.dll)
         if: runner.os == 'Windows'
         shell: powershell
         run: |
-          & build\bin\Release\amdgpu-server.exe --help | Out-Null
+          & build\package\Release\bin\amdgpu-server.exe --help | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "amdgpu-server --help failed ($LASTEXITCODE)" }
 
       - name: (win) Package
         if: runner.os == 'Windows'
         shell: powershell
         run: |
-          tar -a -c -f "${{ matrix.asset }}" -C build\bin\Release .
+          tar -a -c -f "${{ matrix.asset }}" -C build\package\Release .
           Write-Host ("${{ matrix.asset }} = {0:N1} MB" -f ((Get-Item "${{ matrix.asset }}").Length/1MB))
-
-      # ------------------------------ Linux ------------------------------
-      - name: (linux) Download hip-ep gpu-test-package
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-          ver="${{ env.HIP_EP_VERSION }}"
-          url="https://github.com/ROCm/hip-ep/releases/download/$ver/gpu-test-package-linux-$ver.zip"
-          echo "Downloading $url"
-          curl -fsSL "$url" -o pkg.zip
-          rm -rf pkg && mkdir pkg
-          # unzip preserves the .so symlink chain; fall back to bsdtar.
-          if command -v unzip >/dev/null; then unzip -q pkg.zip -d pkg; else tar -xf pkg.zip -C pkg; fi
-          so=$(find pkg -name libonnxruntime-genai.so | head -1)
-          test -n "$so" || { echo "libonnxruntime-genai.so not found"; exit 1; }
-          root=$(dirname "$(dirname "$so")")   # parent of lib/
-          echo "AMDGPU_PKG_ROOT=$root" >> "$GITHUB_ENV"
-
-      - name: (linux) Configure & build
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j"$(nproc)"
-          test -f build/bin/amdgpu-server
-
-      - name: (linux) Smoke test (loads libonnxruntime-genai.so)
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-          ./build/bin/amdgpu-server --help >/dev/null
-
-      - name: (linux) Package
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-          # tar preserves the .so symlink chain and exec bits.
-          tar -czf "${{ matrix.asset }}" -C build/bin .
-          echo "${{ matrix.asset }} = $(du -m "${{ matrix.asset }}" | cut -f1) MB"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -137,30 +124,61 @@ jobs:
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version from CMakeLists.txt
+        id: get_version
+        run: |
+          VERSION=$(grep -oP 'project\(amdgpu-server VERSION \K[0-9]+\.[0-9]+\.[0-9]+' CMakeLists.txt)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Detected version: $VERSION"
+          # The release is published under the project version, so the pushed
+          # tag has to name the same version.
+          if [ "$GITHUB_REF_NAME" != "v$VERSION" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match project version v$VERSION" >&2
+            exit 1
+          fi
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+
       - name: List assets
         run: ls -la dist
-      - uses: softprops/action-gh-release@v2
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
-          name: AMD GPU Server ${{ github.ref_name }}
+          tag_name: v${{ steps.get_version.outputs.version }}
+          name: AMD GPU Server v${{ steps.get_version.outputs.version }}
           body: |
-            OpenAI-compatible OGA server for AMD GPUs (AMDGPU EP / gfx1151).
+            ## AMD GPU Server v${{ steps.get_version.outputs.version }}
+
+            OpenAI API-compatible server for running LLMs and VLMs on AMD GPUs with the HIP EP (AMDGPU execution provider).
 
             Built against [ROCm/hip-ep ${{ env.HIP_EP_VERSION }}](https://github.com/ROCm/hip-ep/releases/tag/${{ env.HIP_EP_VERSION }}).
             Consumed by [Lemonade](https://github.com/lemonade-sdk/lemonade) as the `amdgpu-llm` backend.
 
-            | Platform | Asset |
-            |----------|-------|
-            | Windows x64 | `amdgpu-server-windows-x64.zip` |
-            | Linux x64   | `amdgpu-server-linux-x64.tar.gz` |
+            ### Installation
 
-            Each bundles `amdgpu-server` with the AMDGPU EP / ROCm / ONNX Runtime
-            GenAI runtime. Requires an AMD gfx1151 (Strix Halo) GPU with the AMD
-            graphics driver / ROCm installed.
+            Download `amdgpu-server-windows-x64.zip` and extract to your preferred location.
+            The archive bundles `amdgpu-server.exe` with the HIP EP, ROCm and ONNX Runtime GenAI runtime.
+
+            ### Requirements
+
+            - Windows 11 (64-bit)
+            - AMD GPU supported by the HIP EP (validated on gfx1151, Strix Halo)
+            - AMD graphics driver
+
+            ### Usage
+
+            ```cmd
+            bin\amdgpu-server.exe -m C:\path\to\onnx\model
+            ```
+
+            See the [README](https://github.com/lemonade-sdk/amdgpu-server#readme) for full documentation.
+          files: dist/*
           draft: false
           prerelease: false
         env:

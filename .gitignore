@@ -29,6 +29,10 @@ external/
 *.so
 *.dylib
 
+# Test output
+test/test_logs/
+__pycache__/
+
 # IDE
 .vscode/
 .idea/

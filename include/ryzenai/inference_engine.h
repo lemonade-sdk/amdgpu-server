@@ -103,6 +103,9 @@ private:
                                        const GenerationParams& params, bool reuse_kv,
                                        std::unique_ptr<OgaGenerator>& owned);
 
+    // Drop the persistent chat generator and its cache. Caller holds inference_mutex_.
+    void discardChatGenerator();
+
     std::unique_ptr<OgaModel> model_;
     std::unique_ptr<OgaTokenizer> tokenizer_;
     std::unique_ptr<OgaMultiModalProcessor> processor_;  // only for multimodal models
